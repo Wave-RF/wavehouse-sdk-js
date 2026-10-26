@@ -1,0 +1,30 @@
+# This file marks the repo root as its own pnpm workspace so pnpm 11 does not
+# walk up to an ancestor workspace file. `.` is the SDK package itself.
+packages:
+  - "."
+
+# esbuild (via tsup and vitest) ships a postinstall binary.
+allowBuilds:
+  esbuild: true
+
+minimumReleaseAge: 10080
+
+# Exempt our own first-party packages from the release-age cooldown above. The
+# cooldown is a supply-chain defense against compromised third-party releases;
+# packages we publish ourselves are trusted immediately.
+minimumReleaseAgeExclude:
+  - "@wave-rf/*"
+  - "@wavehouse/*"
+
+# Fail an install when the active Node doesn't satisfy a package's engines.node.
+# The SDK declares ">=22", matching the dev/CI version pinned in .nvmrc.
+engineStrict: true
+
+# Disable the virtual store's hoisted fallback (node_modules/.pnpm/node_modules),
+# so a dependency that imports something it doesn't declare fails to resolve
+# instead of silently picking up a transitive copy.
+hoist: false
+
+# node_modules is derived state: re-link on a layout change (such as the hoist
+# setting above) instead of prompting, because a prompt aborts with no TTY.
+confirmModulesPurge: false

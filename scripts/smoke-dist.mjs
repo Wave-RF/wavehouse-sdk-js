@@ -1,5 +1,5 @@
 // Loads each built entry point the way a consumer does and checks they agree.
-// Run it at the oldest Node the package supports (`make smoke-ts-dist`):
+// Run it at the oldest Node the package supports (`make smoke`):
 // a dependency that is ESM-only breaks `require()` there but not on a current Node.
 import { spawnSync } from "node:child_process";
 import {

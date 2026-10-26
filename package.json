@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "TypeScript SDK for WaveHouse — schema-aware real-time API gateway for ClickHouse",
   "type": "module",
+  "packageManager": "pnpm@11.21.0",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -44,28 +45,30 @@
     "smoke:dist": "node scripts/smoke-dist.mjs",
     "prepare": "pnpm run build",
     "prepublishOnly": "pnpm run typecheck && pnpm run build",
-    "codegen": "tsx src/cli/codegen.ts"
+    "codegen": "tsx src/cli/codegen.ts",
+    "lint": "biome check --error-on-warnings .",
+    "fix": "biome check --write ."
   },
   "dependencies": {
     "eventsource-parser": "^3.1.1"
   },
   "devDependencies": {
-    "@types/node": "catalog:",
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^26.6.5",
     "@vitest/coverage-v8": "^5.0.4",
     "tsup": "^8.0.0",
     "tsx": "^4.23.15",
-    "typescript": "catalog:",
-    "vitest": "catalog:"
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.4"
   },
   "author": "Wave RF",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Wave-RF/WaveHouse.git",
-    "directory": "clients/ts"
+    "url": "git+https://github.com/Wave-RF/wavehouse-sdk-js.git"
   },
-  "homepage": "https://wavehouse.dev",
-  "bugs": "https://github.com/Wave-RF/WaveHouse/issues",
+  "homepage": "https://wavehouse.dev/sdk",
+  "bugs": "https://github.com/Wave-RF/wavehouse-sdk-js/issues",
   "keywords": [
     "wavehouse",
     "clickhouse",

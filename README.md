@@ -154,23 +154,25 @@ This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, a
 
 ## Development & Testing
 
+Clone, then `pnpm install` (Node 22 or newer). `make ci` runs everything CI runs; `make fix` formats and applies safe lint fixes.
+
 ### Unit Tests
 
 Unit tests mock all HTTP calls — no backend required.
 
 ```bash
-npm test               # run unit tests (no backend needed)
-npm run test:watch     # watch mode
-npm run test:coverage  # coverage report
+pnpm test               # run unit tests (no backend needed)
+pnpm run test:watch     # watch mode
+pnpm run test:coverage  # coverage report, gated at a 40% statement floor
 ```
 
 ### Built Package Smoke Check
 
-`make smoke-ts-dist` (run by `make build-ts`) imports and `require()`s the built package by name (through its `exports` map) and runs the IIFE bundle as a classic script, at the oldest Node that `engines.node` admits, and checks that all three export the same names. It also type-checks a CommonJS and an ESM consumer of the package with `tsc --module node16`, so a CommonJS project (`"type": "commonjs"`) gets its own `.d.cts` declarations rather than TS1479. It downloads that Node once into `.bin/`. `pnpm run smoke:dist` runs the same check on the Node you are running.
+`make smoke` imports and `require()`s the built package by name (through its `exports` map) and runs the IIFE bundle as a classic script, at the oldest Node that `engines.node` admits, and checks that all three export the same names. It also type-checks a CommonJS and an ESM consumer of the package with `tsc --module node16`, so a CommonJS project (`"type": "commonjs"`) gets its own `.d.cts` declarations rather than TS1479. It downloads that Node once into `.bin/`. `pnpm run smoke:dist` runs the same check on the Node you are running.
 
-### E2E Integration Tests
+### Issues
 
-E2E tests live in `tests/e2e/sdk/` (repo root) and exercise the full pipeline through the SDK. See `make test-e2e` in the [Development Guide](https://wavehouse.dev/development#e2e-tests-via-sdk).
+Report SDK bugs at [Wave-RF/wavehouse-sdk-js/issues](https://github.com/Wave-RF/wavehouse-sdk-js/issues). Server bugs go to [Wave-RF/WaveHouse](https://github.com/Wave-RF/WaveHouse/issues). Until this repository existed the SDK lived in the WaveHouse repository under `clients/ts`, and its history up to 0.2.0 is carried over here.
 
 ## API Reference
 

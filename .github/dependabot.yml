@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      # One PR per Monday for all action bumps; with SHA pinning, ungrouped meant several identical reviews.
+      actions-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      npm-deps:
+        patterns: ["*"]
+    ignore:
+      # TypeScript 7 is held back by tsup: tsup 8.5.1 vendors rollup-plugin-dts 6.1.1, which crashes
+      # on TS 7 when `dts: true` runs. rollup-plugin-dts >= 6.5.0 supports TS 7; drop this once tsup vendors it.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # eventsource-parser 4 drops its CJS build and raises engines.node to >=22.12, but this SDK ships
+      # CJS and advertises ">=22", so v4 breaks the CJS entry on Node 22.0-22.11. Raising the floor or
+      # dropping CJS is a decision, not a dependency sweep.
+      - dependency-name: "eventsource-parser"
+        update-types: ["version-update:semver-major"]
+    # Dependabot knows nothing of pnpm's minimumReleaseAge (7 days, see pnpm-workspace.yaml); matching the
+    # window means a release younger than it is not proposed. Security updates bypass cooldown.
+    cooldown:
+      default-days: 7
+      exclude:
+        - "@wave-rf/*"
+        - "@wavehouse/*"
+    commit-message:
+      prefix: "deps"
