@@ -17,9 +17,13 @@ name: Publish SDK (npm)
 # still the WaveHouse repository's publish-npm.yml, so a publish from here
 # would fail (and must not race that workflow). Cutover:
 #   1. On npmjs.com, re-point the @wavehouse/sdk trusted publisher to this
-#      repository's publish-npm.yml.
+#      repository's publish-npm.yml, with environment `npm`.
 #   2. Set the repository variable NPM_PUBLISH_ENABLED to 'true' here.
 #   3. Remove SDK publishing from the WaveHouse repository.
+#
+# Both jobs run in the `npm` environment, which only `main` and `v*` tags may
+# deploy to, and npm accepts a publish only from that environment: a workflow
+# run from any other ref can't publish even if it reaches these jobs.
 #
 # The TAG is the version. The release job writes the tag's version into
 # package.json before publishing rather than checking that someone remembered
@@ -74,6 +78,7 @@ jobs:
     name: Dev snapshot (@dev)
     if: vars.NPM_PUBLISH_ENABLED == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: npm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -182,6 +187,7 @@ jobs:
     name: Release (v* tag)
     if: vars.NPM_PUBLISH_ENABLED == 'true' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    environment: npm
     timeout-minutes: 15
     permissions:
       contents: write # create the GitHub Release
