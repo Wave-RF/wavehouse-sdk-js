@@ -3,7 +3,7 @@ import { createClient } from "../client.js";
 import type { FetchLike, Result, StreamEvent, StreamStatus } from "../types.js";
 import type { StreamTransport } from "./controller.js";
 import { StreamController } from "./controller.js";
-import { LiveQuery } from "./live-query.js";
+import { LiveQuery, parseInstant } from "./live-query.js";
 
 /**
  * `liveQuery()` opens the stream and runs the REST backfill in the same tick,
@@ -217,5 +217,72 @@ describe("liveQuery backfill isolation", () => {
     );
     t.fire(ev("2026-01-01T00:00:01Z", 1));
     await vi.waitFor(() => expect(seen).toEqual([1]));
+  });
+});
+
+describe("liveQuery dedup boundary", () => {
+  async function run(rows: Record<string, unknown>[], events: StreamEvent[]) {
+    const { t, stream } = manualStream();
+    const seen: number[] = [];
+    new LiveQuery(
+      stream,
+      async () => ({ ok: true, data: rows, error: null }) as Result<Record<string, unknown>[]>,
+      { next: (e) => seen.push(e.data.n as number) },
+      [],
+    );
+    for (const e of events) t.fire(e);
+    await new Promise((r) => setTimeout(r, 10));
+    return seen;
+  }
+
+  it("takes the newest row, not the last, so a descending order does not repeat rows", async () => {
+    const seen = await run(
+      [
+        { received_timestamp: "2026-01-01T00:00:09Z" },
+        { received_timestamp: "2026-01-01T00:00:05Z" },
+      ],
+      [ev("2026-01-01T00:00:06Z", 1), ev("2026-01-01T00:00:09Z", 2), ev("2026-01-01T00:00:10Z", 3)],
+    );
+    expect(seen).toEqual([3]);
+  });
+
+  it("compares instants, not strings, across second and sub-second precision", async () => {
+    // As text "…:05Z" > "…:05.123Z" ('Z' sorts after '.'), which would drop the
+    // event that is in fact 123ms newer than the boundary row.
+    const seen = await run(
+      [{ received_timestamp: "2026-01-01T00:00:05Z" }],
+      [ev("2026-01-01T00:00:05.123Z", 1), ev("2026-01-01T00:00:04.999Z", 2)],
+    );
+    expect(seen).toEqual([1]);
+  });
+
+  it("keeps sub-millisecond differences", async () => {
+    const seen = await run(
+      [{ received_timestamp: "2026-01-01T00:00:05.123456000Z" }],
+      [ev("2026-01-01T00:00:05.123456789Z", 1), ev("2026-01-01T00:00:05.123455999Z", 2)],
+    );
+    expect(seen).toEqual([1]);
+  });
+
+  it("ignores rows whose timestamp does not parse, and delivers events whose own does not", async () => {
+    const seen = await run(
+      [{ received_timestamp: "garbage" }, { received_timestamp: "2026-01-01 00:00:05" }],
+      [ev("2026-01-01T00:00:04Z", 1), ev("not-a-time", 2), ev("2026-01-01T00:00:06Z", 3)],
+    );
+    expect(seen).toEqual([2, 3]);
+  });
+
+  it("delivers everything when the rows carry no timestamp column", async () => {
+    const seen = await run([{ page: "/a" }], [ev("2026-01-01T00:00:04Z", 1)]);
+    expect(seen).toEqual([1]);
+  });
+});
+
+describe("parseInstant", () => {
+  it("reads offsets and rejects non-timestamps", () => {
+    expect(parseInstant("2026-01-01T01:00:00+01:00")).toBe(parseInstant("2026-01-01T00:00:00Z"));
+    expect(parseInstant("2026-01-01T00:00:00+0100")).toBe(parseInstant("2025-12-31T23:00:00Z"));
+    expect(parseInstant(5)).toBeUndefined();
+    expect(parseInstant("yesterday")).toBeUndefined();
   });
 });
