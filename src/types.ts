@@ -11,13 +11,15 @@ export type Database = Record<string, Record<string, unknown>>;
 
 /**
  * Discriminated union for the async SDK calls that return one. Never throws for
- * anything the server returns; a non-absolute `baseURL` and a rejecting `auth`
- * callback do throw, while a runtime with no `fetch` at all surfaces instead as
- * a retried `NETWORK_ERROR` result.
+ * anything the server returns. A `baseURL` that names no host (a bare path such
+ * as `/api/warehouse`) or carries a query or fragment throws from `createClient`;
+ * a `baseURL` that is otherwise unusable (`https://[`) and a rejecting `auth`
+ * callback throw from the call, while a runtime with no `fetch` at all surfaces
+ * instead as a retried `NETWORK_ERROR` result.
  *
- * `.stream()` and `.liveQuery()` return no `Result` and report the same three
- * differently: a non-absolute `baseURL` reaches the subscriber's `error`
- * callback as a terminal `SSE_CONNECT_ERROR`, a rejecting `auth` as a retryable
+ * `.stream()` and `.liveQuery()` return no `Result` and report the last three
+ * differently: an unusable `baseURL` reaches the subscriber's `error` callback
+ * as a terminal `SSE_CONNECT_ERROR`, a rejecting `auth` as a retryable
  * `SSE_AUTH_ERROR`, and only a missing `fetch` throws from the call itself.
  *
  * Discriminated on `ok`: `if (result.ok)` narrows to the success arm (and tells
@@ -76,11 +78,13 @@ export interface ClientConfig<_DB extends Database = Database> {
    * ingress; request paths are appended to it. The proxy in front must strip
    * the prefix before forwarding.
    *
-   * Must be **absolute** — scheme and host included. The transports report a
-   * relative value such as "/api/warehouse" differently: a REST call rejects
-   * with a `TypeError` instead of returning a `Result`, while a stream reports
-   * `SSE_CONNECT_ERROR` to the subscriber's `error` callback. Build an absolute
-   * one: `` `${location.origin}/api/warehouse` ``.
+   * Must name a **host**; the scheme may be left off (`http://` for a loopback
+   * host, `https://` otherwise). A bare path such as "/api/warehouse" has no
+   * host, so `createClient` throws a `TypeError` for it, as it does for a query
+   * string or fragment. Build an absolute one:
+   * `` `${location.origin}/api/warehouse` ``. A base that is otherwise unusable
+   * is reported per call: a REST call rejects with a `TypeError`, and a stream
+   * reports `SSE_CONNECT_ERROR` to the subscriber's `error` callback.
    */
   baseURL: string;
   /**
@@ -114,9 +118,11 @@ export interface ClientConfig<_DB extends Database = Database> {
  *
  * On REST the SDK reads `.ok` and `.headers` always, `.text()` on success, and
  * `.status`, `.statusText` plus `.json()` when the response is not `ok`. A
- * rejection becomes a `NETWORK_ERROR` result and is retried with backoff —
- * unless the `AbortSignal` you passed has been aborted, in which case the
- * result is `ABORTED` and nothing is retried. That is decided from the signal
+ * rejection becomes a `NETWORK_ERROR` result and is retried with backoff on
+ * reads and ingest, but not on raw SQL (`wh.sql()`) or pipe calls, which are
+ * resent only when the connection was certainly never made — unless the
+ * `AbortSignal` you passed has been aborted, in which case the result is
+ * `ABORTED` and nothing is retried. That is decided from the signal
  * rather than the rejection's type, so an implementation that throws something
  * other than a `DOMException` named `AbortError` — `AbortSignal.timeout()`,
  * `node-fetch` — is reported the same way.

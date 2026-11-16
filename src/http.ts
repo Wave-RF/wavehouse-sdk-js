@@ -29,8 +29,10 @@ interface RequestSpec {
   fetchOptions?: RequestInit;
   fetch?: FetchLike;
   /**
-   * How safely a call can be sent twice. `read` (the default, and ingest, which
-   * dedupes) retries as before. `sql` and `pipe` may run a write, so they are
+   * How safely a call can be sent twice. `read` (the default, and ingest)
+   * retries; ingest is at-least-once, and a resent batch is only deduplicated
+   * when the tenant sets the server's `dedupe` setting and the rows carry an id
+   * field. `sql` and `pipe` may run a write, so they are
    * resent only when the first attempt certainly did nothing — see `mayResend`.
    */
   kind?: CallKind;

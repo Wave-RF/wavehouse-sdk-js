@@ -172,8 +172,9 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
   }
 
   orderBy(column: string, dir: "asc" | "desc" = "asc"): QueryBuilder<Row> {
-    // The server reads anything but "desc" as ascending, so "DESC" would sort
-    // the wrong way without a word; lowercase it and refuse what is not a direction.
+    // The server lowercases the direction itself, so lowercasing here changes
+    // nothing on the wire. What this adds is the check: a value that is not a
+    // direction is an error here, not whatever the server makes of it.
     const d = String(dir).toLowerCase();
     if (d !== "asc" && d !== "desc") {
       return this._clone({

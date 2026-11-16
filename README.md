@@ -144,7 +144,7 @@ const wh = createClient({
 });
 
 // Per call: headers, fetchOptions (Next.js `next: { tags }`) and a request-scoped fetch.
-await wh.from('clicks').select('*').fetch({
+await wh.from('clicks').selectAll().fetch({
   headers: { 'X-Trace-Id': traceId },
   fetchOptions: { next: { tags: ['clicks'] } },
   attemptTimeoutMs: 2_000,
@@ -174,7 +174,7 @@ const { data } = await wh.from('clicks').select('page').limit(10);
 
 Async request methods return a `Result<T>` object — destructure it as `{ data, error }` — and never throw for anything the server returns. `.stream()` and `.liveQuery()` return controllers instead, reporting failures through the subscriber's `error` callback.
 
-The SDK does throw on caller and environment errors: a non-absolute `baseURL` (REST calls reject with a `TypeError`; streams report a terminal `SSE_CONNECT_ERROR`), `.stream()` / `.liveQuery()` in a runtime with no global `fetch` and no `options.fetch`, and an `auth` callback that rejects — a token-refresh failure propagates out of the REST call, and on a stream is reported as a retryable `SSE_AUTH_ERROR`. A dropped stream *is* re-dialed by the SDK, on a jittered backoff; only non-retryable failures end it. A subscriber callback that throws is logged and isolated: it costs only its own delivery, and never the other subscribers or the SDK call that registered it — see [Error Handling](https://wavehouse.dev/sdk/reference#error-handling).
+The SDK does throw on caller and environment errors: a `baseURL` that names no host, such as `/api/warehouse`, or carries a query or fragment (`createClient` throws a `TypeError`; any other unusable base makes REST calls reject with a `TypeError` and streams report a terminal `SSE_CONNECT_ERROR`), `.stream()` / `.liveQuery()` in a runtime with no global `fetch` and no `options.fetch`, and an `auth` callback that rejects — a token-refresh failure propagates out of the REST call, and on a stream is reported as a retryable `SSE_AUTH_ERROR`. A dropped stream *is* re-dialed by the SDK, on a jittered backoff; only non-retryable failures end it. A subscriber callback that throws is logged and isolated: it costs only its own delivery, and never the other subscribers or the SDK call that registered it — see [Error Handling](https://wavehouse.dev/sdk/reference#error-handling).
 
 ```ts
 const { data, error } = await wh.from('clicks').fetch();
