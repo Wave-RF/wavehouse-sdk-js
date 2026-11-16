@@ -1,6 +1,6 @@
 import { createParser } from "eventsource-parser";
 import { parseErrorResponse } from "../errors.js";
-import { mergeHeaders } from "../http.js";
+import { attemptTimeout, mergeHeaders } from "../http.js";
 import type { FetchLike, StreamEvent, StreamStatus, WaveHouseError } from "../types.js";
 import { resolveURL } from "../url.js";
 import type { StreamTransport } from "./controller.js";
@@ -12,6 +12,8 @@ export interface SSEOptions {
   auth?: () => Promise<string> | string;
   fetch?: FetchLike;
   headers?: Record<string, string>;
+  /** Per-connect deadline up to the response headers; never an established stream. */
+  attemptTimeoutMs?: number;
   fetchOptions?: RequestInit;
 }
 
@@ -85,6 +87,17 @@ function parseRetryAfter(value: string | null): number | undefined {
   const ms = /^\d+$/.test(v) ? Number(v) * 1000 : Date.parse(v) - Date.now();
   if (!Number.isFinite(ms) || ms <= 0) return undefined;
   return Math.min(ms, MAX_BACKOFF_MS);
+}
+
+/** Rejects with the signal's reason once `ac` aborts. */
+function rejectOnAbort(ac: AbortController): Promise<never> {
+  const p = new Promise<never>((_, reject) => {
+    if (ac.signal.aborted) reject(ac.signal.reason);
+    else ac.signal.addEventListener("abort", () => reject(ac.signal.reason), { once: true });
+  });
+  // Only meaningful while raced; settled later it must not be unhandled.
+  p.catch(() => {});
+  return p;
 }
 
 /** Outcome of one connection attempt, driving the reconnect decision. */
@@ -315,18 +328,53 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       return { liveMs: 0, terminal: false };
     }
 
+    // The per-attempt deadline bounds the connect, up to the response headers:
+    // an established stream is long-lived and has no deadline of its own. It
+    // aborts the same controller `disconnect()` does, which is safe because
+    // `_closed` tells the two apart.
+    const timeoutMs = attemptTimeout(this._opts.attemptTimeoutMs);
+    let timedOut = false;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            ac.abort();
+          }, timeoutMs);
+    const timeoutError = (): WaveHouseError => ({
+      status: 0,
+      code: "SSE_ATTEMPT_TIMEOUT",
+      message: `The stream connection got no response within ${timeoutMs} ms`,
+      retryable: true,
+    });
+
     let res: Response;
     try {
       const doFetch = this._opts.fetch;
-      res = doFetch ? await doFetch(target, init) : await fetch(target, init);
+      const pending = doFetch ? doFetch(target, init) : fetch(target, init);
+      // Raced against the abort so a `fetch` that ignores its signal still
+      // lets the deadline end the attempt.
+      res = await (timer === undefined ? pending : Promise.race([pending, rejectOnAbort(ac)]));
     } catch (e) {
+      clearTimeout(timer);
       if (this._closed) return { liveMs: 0, terminal: true };
-      this._emitError({
-        status: 0,
-        code: "SSE_NETWORK_ERROR",
-        message: e instanceof Error ? e.message : String(e),
-        retryable: true,
-      });
+      this._emitError(
+        timedOut
+          ? timeoutError()
+          : {
+              status: 0,
+              code: "SSE_NETWORK_ERROR",
+              message: e instanceof Error ? e.message : String(e),
+              retryable: true,
+            },
+      );
+      return { liveMs: 0, terminal: false };
+    }
+    clearTimeout(timer);
+    if (timedOut && !this._closed) {
+      // The headers arrived as the deadline fired, so the body is aborted too.
+      releaseBody(res);
+      this._emitError(timeoutError());
       return { liveMs: 0, terminal: false };
     }
 

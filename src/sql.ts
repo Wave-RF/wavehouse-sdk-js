@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request, tenantParam } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Result } from "./types.js";
 
 /**
@@ -45,7 +45,7 @@ export async function sql<Row = Record<string, unknown>>(
     params: tenantParam(opts),
     body: { sql: query },
     kind: "sql",
-    signal: opts?.signal,
+    ...callOpts(opts),
   });
   if (error) return err(error);
   return ok(data!);

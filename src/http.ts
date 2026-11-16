@@ -1,5 +1,5 @@
 import { networkError, parseErrorResponse } from "./errors.js";
-import type { HttpContext, OpsRequestOptions, WaveHouseError } from "./types.js";
+import type { CallOptions, HttpContext, OpsRequestOptions, WaveHouseError } from "./types.js";
 import { resolveURL } from "./url.js";
 
 interface RequestSpec {
@@ -16,6 +16,8 @@ interface RequestSpec {
   contentType?: string;
   params?: Record<string, string>;
   signal?: AbortSignal;
+  /** Per-call override of the client's `attemptTimeoutMs`; see {@link CallOptions}. */
+  attemptTimeoutMs?: number;
   /**
    * How safely a call can be sent twice. `read` (the default, and ingest, which
    * dedupes) retries as before. `sql` and `pipe` may run a write, so they are
@@ -67,6 +69,65 @@ export function mergeHeaders(
     configured.set(lower, name);
   }
   return merged;
+}
+
+/**
+ * The per-call fields of an options object, for spreading into a `RequestSpec`.
+ * Picks fields by name so an options value carrying anything else (`limit`,
+ * `tenant`) never leaks into the spec.
+ *
+ * @internal
+ */
+export function callOpts(opts?: CallOptions): Pick<RequestSpec, "signal" | "attemptTimeoutMs"> {
+  return { signal: opts?.signal, attemptTimeoutMs: opts?.attemptTimeoutMs };
+}
+
+/** A usable per-attempt timeout: a positive finite number of milliseconds. */
+export function attemptTimeout(ms: number | undefined): number | undefined {
+  return typeof ms === "number" && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+/**
+ * One attempt's own deadline, linked to the caller's signal. Firing the timer
+ * aborts `signal` (what `fetch` gets) and rejects `race`, which covers a `fetch`
+ * that ignores its signal; the caller's abort propagates too, so either ends the
+ * attempt, and `timedOut` says which. Without a timeout it is the caller's
+ * signal and a no-op.
+ *
+ * @internal
+ */
+export function attemptGuard(caller: AbortSignal | undefined, ms: number | undefined) {
+  if (ms === undefined) {
+    return {
+      signal: caller,
+      timedOut: false,
+      race: <T>(p: Promise<T>) => p,
+      dispose: () => {},
+    };
+  }
+  const ac = new AbortController();
+  const guard = {
+    signal: ac.signal as AbortSignal | undefined,
+    timedOut: false,
+    race: <T>(p: Promise<T>): Promise<T> => Promise.race([p, rejected]),
+    dispose: () => {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    },
+  };
+  const rejected = new Promise<never>((_, reject) => {
+    ac.signal.addEventListener("abort", () => reject(ac.signal.reason), { once: true });
+  });
+  // Unhandled otherwise: it only rejects when nothing is racing it any more.
+  rejected.catch(() => {});
+  const onCaller = () => ac.abort(caller?.reason);
+  if (caller?.aborted) ac.abort(caller.reason);
+  else caller?.addEventListener("abort", onCaller, { once: true });
+  const timer = setTimeout(() => {
+    guard.timedOut = true;
+    ac.abort(new DOMException(`Attempt timed out after ${ms} ms`, "TimeoutError"));
+  }, ms);
+  return guard;
 }
 
 /**
@@ -173,7 +234,10 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   let lastError: WaveHouseError | null = null;
   const maxAttempts = ctx.options.maxRetries + 1;
 
+  const timeoutMs = attemptTimeout(opts.attemptTimeoutMs ?? ctx.options.attemptTimeoutMs);
+
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const guard = attemptGuard(opts.signal, timeoutMs);
     try {
       // Configured RequestInit first, so the fields the SDK controls overwrite
       // it — a supplied `method` or `body` would otherwise corrupt the request.
@@ -182,21 +246,21 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         method: opts.method,
         headers: finalHeaders,
         body: requestBody,
-        signal: opts.signal,
+        signal: guard.signal,
       };
       // Call the global directly when no override is configured, rather than
       // capturing it — a detached `fetch` reference is not universally safe to
       // invoke, and late binding is what lets tests swap `globalThis.fetch`.
       const doFetch = ctx.options.fetch;
-      const res = doFetch ? await doFetch(url, init) : await fetch(url, init);
+      const res = await guard.race(doFetch ? doFetch(url, init) : fetch(url, init));
 
       if (res.ok) {
-        const text = await res.text();
+        const text = await guard.race(res.text());
         const data = text ? (JSON.parse(text) as T) : (undefined as T);
         return { data, error: null, headers: res.headers };
       }
 
-      const error = await parseErrorResponse(res);
+      const error = await guard.race(parseErrorResponse(res));
 
       if (!mayResendResponse(kind, error, res)) {
         return { data: null, error, headers: res.headers };
@@ -215,6 +279,7 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         if (wait !== undefined && wait > cap) {
           return { data: null, error, headers: res.headers };
         }
+        guard.dispose();
         await sleep(wait === undefined ? backoff(attempt) : jitter(wait), opts.signal);
         lastError = error;
         continue;
@@ -222,6 +287,7 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
 
       // Retryable server errors (5xx)
       if (error.retryable && attempt < maxAttempts - 1) {
+        guard.dispose();
         await sleep(backoff(attempt), opts.signal);
         lastError = error;
         continue;
@@ -245,7 +311,9 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         return abortedResult<T>();
       }
 
-      lastError = networkError(e);
+      lastError = guard.timedOut
+        ? attemptTimeoutError(timeoutMs ?? 0, attempt + 1)
+        : networkError(e);
       // The request may have reached the server; resending could run it twice.
       // Reported as not retryable too: `retryable` tells the caller a resend is safe.
       if (kind !== "read" && !neverSent(e)) {
@@ -258,6 +326,7 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         // `request()` as a raw DOMException instead of the documented ABORTED
         // result — and no caller wraps this, so it would reach the consumer as
         // an unhandled rejection.
+        guard.dispose();
         try {
           await sleep(backoff(attempt), opts.signal);
         } catch (abort) {
@@ -269,10 +338,26 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
           throw abort;
         }
       }
+    } finally {
+      guard.dispose();
     }
   }
 
   return { data: null, error: lastError!, headers: new Headers() };
+}
+
+/**
+ * What a call ends with when its last attempt hit `attemptTimeoutMs`. Not a
+ * caller abort (that is `ABORTED`), and it says how many attempts were made.
+ * Retryable here; the catch below clears that for a call that may have written.
+ */
+function attemptTimeoutError(ms: number, attempts: number): WaveHouseError {
+  return {
+    status: 0,
+    code: "ATTEMPT_TIMEOUT",
+    message: `Attempt timeout: no complete response within ${ms} ms, after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
+    retryable: true,
+  };
 }
 
 const MAX_BACKOFF_MS = 30_000;

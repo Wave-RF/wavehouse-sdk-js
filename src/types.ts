@@ -138,6 +138,24 @@ export interface ClientOptions {
   /** Maximum retry attempts for failed requests. Default: 2. */
   maxRetries?: number;
   /**
+   * A deadline for each attempt on its own, in milliseconds, so a stalled
+   * attempt is retried instead of holding the whole call. Default: off. A
+   * per-call `attemptTimeoutMs` overrides it, and `0` turns it off for that
+   * call.
+   *
+   * It runs from sending the request to the end of the response body, linked to
+   * the caller's `signal`: the caller's own abort still ends the call at once
+   * with `ABORTED` and is never retried. An attempt that hits it is retried
+   * after a backoff while `maxRetries` allows, with the same safety rules as any
+   * network error — `wh.sql()` and pipe calls are not resent once the request
+   * may have been sent, which a timeout always counts as. The call that gives
+   * up returns `ATTEMPT_TIMEOUT`, naming the number of attempts.
+   *
+   * For `.stream()` and `.liveQuery()` it bounds each connect, up to the
+   * response headers, and never an established stream, which is long-lived.
+   */
+  attemptTimeoutMs?: number;
+  /**
    * Longest `Retry-After` wait, in milliseconds, a REST call will sit through
    * before retrying a 503 (or a 429 on a pipe call). When the server asks for
    * more, the call returns that response as its error instead of sleeping.
@@ -471,13 +489,25 @@ export interface SettingsReloadResult {
 // --- Per-call request options ---
 
 /**
+ * What every REST call takes: a signal, and per-call overrides of the client's
+ * `options`.
+ */
+export interface CallOptions {
+  signal?: AbortSignal;
+  /**
+   * This call's own per-attempt deadline in milliseconds, over the client's
+   * `options.attemptTimeoutMs`; `0` switches it off for this call.
+   */
+  attemptTimeoutMs?: number;
+}
+
+/**
  * Options for a single call, passed to `.fetch()`.
  *
  * Note that `await`ing a builder directly (`await wh.from("t").select("*")`)
  * takes no options — use the explicit `.fetch({ … })` form for those.
  */
-export interface RequestOptions {
-  signal?: AbortSignal;
+export interface RequestOptions extends CallOptions {
   limit?: number;
 }
 
@@ -492,8 +522,7 @@ export interface RequestOptions {
  * A pipe's row cap belongs in its SQL as a `{{limit}}` parameter, supplied via
  * `wh.pipe(name, { limit })`.
  */
-export interface PipeRequestOptions {
-  signal?: AbortSignal;
+export interface PipeRequestOptions extends CallOptions {
   /** Not supported on pipes — pass `limit` as a pipe parameter instead. */
   limit?: never;
 }
@@ -504,8 +533,7 @@ export interface PipeRequestOptions {
  * `wh.schema.list()`, `wh.schema.refresh()`, `wh.from(t).schema()`,
  * `wh.dlq.list()`, `wh.dlq.table()` and `wh.sql()`.
  */
-export interface OpsRequestOptions {
-  signal?: AbortSignal;
+export interface OpsRequestOptions extends CallOptions {
   /**
    * The tenant the call addresses, sent as `?tenant=`. The admin routes ignore
    * the `X-Tenant-ID` header, so `options.headers` cannot select one. Omitted,
@@ -532,6 +560,11 @@ export interface VersionInfo {
 export interface StreamOptions {
   since?: string;
   signal?: AbortSignal;
+  /**
+   * This subscription's per-attempt deadline for each connect, in milliseconds,
+   * over the client's `options.attemptTimeoutMs`; `0` switches it off.
+   */
+  attemptTimeoutMs?: number;
 }
 
 // --- Internal HTTP context ---
@@ -544,6 +577,7 @@ export interface HttpContext {
   options: {
     maxRetries: number;
     maxRetryAfterMs?: number;
+    attemptTimeoutMs?: number;
     fetch?: FetchLike;
     headers?: Record<string, string>;
     fetchOptions?: RequestInit;

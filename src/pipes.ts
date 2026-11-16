@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request, tenantParam } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Pipe, PipeRequestOptions, Result } from "./types.js";
 
 /** Reference to a named query pipe — PromiseLike for convenient `await`. */
@@ -28,7 +28,7 @@ export class PipeRef<Row = Record<string, unknown>> implements PromiseLike<Resul
       path: `/v1/pipes/${encodeURIComponent(this._name)}`,
       body: this._params ?? {},
       kind: "pipe",
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
@@ -63,7 +63,7 @@ export class PipesNamespace {
       method: "GET",
       path: "/v1/ops/pipes",
       params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
@@ -75,7 +75,7 @@ export class PipesNamespace {
       method: "GET",
       path: `/v1/ops/pipes/${encodeURIComponent(name)}`,
       params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);

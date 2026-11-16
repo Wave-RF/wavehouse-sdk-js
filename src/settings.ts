@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request, tenantParam } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Result, SettingsReloadResult } from "./types.js";
 
 /**
@@ -33,7 +33,7 @@ export class SettingsNamespace {
       method: "POST",
       path: "/v1/ops/settings/reload",
       params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);

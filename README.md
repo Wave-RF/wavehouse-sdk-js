@@ -130,6 +130,20 @@ const { data: build } = await acme.version(); // GET /version: { version, git_co
 
 Admin calls (`/v1/ops/*`) ignore the header and take a per-call `opts.tenant`, sent as `?tenant=`.
 
+### Timeouts
+
+```ts
+const wh = createClient({
+  baseURL: 'http://localhost:8080',
+  options: { attemptTimeoutMs: 8_000 }, // each attempt gets its own deadline; off by default
+});
+
+// Or for one call, through .fetch({ ... }): `await`ing a builder takes no options.
+await wh.from('clicks').select('*').fetch({ attemptTimeoutMs: 2_000 });
+```
+
+`attemptTimeoutMs` bounds one attempt, from sending to the end of the body. A stalled attempt is retried after a backoff while `maxRetries` allows, and the final error is `ATTEMPT_TIMEOUT`, naming the attempt count. Your `signal` still ends the call at once with `ABORTED`. `wh.sql()` and pipe calls are not resent after a timeout, since the request may have run. For streams it bounds each connect up to the response headers, never an established stream.
+
 ## Type Safety
 
 Pass a `Database` type for autocomplete on table names and row shapes:

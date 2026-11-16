@@ -1,6 +1,6 @@
 import { DLQNamespace } from "./dlq.js";
 import { err, ok } from "./errors.js";
-import { request } from "./http.js";
+import { callOpts, request } from "./http.js";
 import { PipeRef, PipesNamespace } from "./pipes.js";
 import { SchemaNamespace } from "./schema.js";
 import { SettingsNamespace } from "./settings.js";
@@ -10,6 +10,7 @@ import { SSETransport } from "./stream/sse.js";
 import { SysNamespace } from "./sys.js";
 import { TableRef } from "./table.js";
 import type {
+  CallOptions,
   ClientConfig,
   Database,
   HttpContext,
@@ -55,6 +56,7 @@ export class WaveHouseClient<DB extends Database = Database> {
       options: {
         maxRetries: config.options?.maxRetries ?? 2,
         maxRetryAfterMs: config.options?.maxRetryAfterMs,
+        attemptTimeoutMs: config.options?.attemptTimeoutMs,
         fetch: config.options?.fetch,
         headers: config.options?.headers,
         fetchOptions: config.options?.fetchOptions,
@@ -71,11 +73,11 @@ export class WaveHouseClient<DB extends Database = Database> {
   /**
    * The server's build metadata, from `GET /version`. Needs no tenant.
    */
-  async version(opts?: { signal?: AbortSignal }): Promise<Result<VersionInfo>> {
+  async version(opts?: CallOptions): Promise<Result<VersionInfo>> {
     const { data, error } = await request<VersionInfo>(this._ctx, {
       method: "GET",
       path: "/version",
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
@@ -135,6 +137,7 @@ export class WaveHouseClient<DB extends Database = Database> {
       auth: this._ctx.auth,
       fetch: this._ctx.options.fetch,
       headers: this._ctx.options.headers,
+      attemptTimeoutMs: opts?.attemptTimeoutMs ?? this._ctx.options.attemptTimeoutMs,
       fetchOptions: this._ctx.options.fetchOptions,
     });
     const controller = new StreamController<T>(transport);

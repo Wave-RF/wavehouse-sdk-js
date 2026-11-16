@@ -19,6 +19,7 @@ export { TableRef } from "./table.js";
 // --- Types ---
 export type {
   Aggregation,
+  CallOptions,
   // Config
   ClientConfig,
   ClientOptions,

@@ -1,5 +1,5 @@
 import { err, okPage } from "./errors.js";
-import { request } from "./http.js";
+import { callOpts, request } from "./http.js";
 import type { StreamTransport } from "./stream/controller.js";
 import { StreamController } from "./stream/controller.js";
 import { LiveQuery } from "./stream/live-query.js";
@@ -262,7 +262,7 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
       method: "POST",
       path: `/v1/query?table=${encodeURIComponent(this._state.table)}`,
       body: ast,
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
 
     if (error) return err(error);

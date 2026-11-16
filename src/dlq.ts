@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request, tenantParam } from "./http.js";
 import type { DLQStats, HttpContext, OpsRequestOptions, Result } from "./types.js";
 
 /** Namespace for Dead Letter Queue operations. */
@@ -19,7 +19,7 @@ export class DLQNamespace {
       method: "GET",
       path: "/v1/ops/dlq/stats",
       params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
@@ -31,7 +31,7 @@ export class DLQNamespace {
       method: "GET",
       path: "/v1/ops/dlq/stats",
       params: { table: name, ...tenantParam(opts) },
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);

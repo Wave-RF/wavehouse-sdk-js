@@ -1,6 +1,6 @@
 import { err, ok } from "./errors.js";
-import { request } from "./http.js";
-import type { HttpContext, Result } from "./types.js";
+import { callOpts, request } from "./http.js";
+import type { CallOptions, HttpContext, Result } from "./types.js";
 
 /** Namespace for the SDK's content-free server-online check. */
 export class SysNamespace {
@@ -18,11 +18,11 @@ export class SysNamespace {
    * reverse proxy. Use it to check a server is online before sending data, or
    * to pick among servers in a distributed setup.
    */
-  async health(opts?: { signal?: AbortSignal }): Promise<Result<void>> {
+  async health(opts?: CallOptions): Promise<Result<void>> {
     const { error } = await request<void>(this._ctx, {
       method: "GET",
       path: "/v1/health",
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok<void>(undefined);

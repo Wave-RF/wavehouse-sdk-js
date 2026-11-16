@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request, tenantParam } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Result, Schemas } from "./types.js";
 
 /** Namespace for schema introspection. */
@@ -21,7 +21,7 @@ export class SchemaNamespace {
       method: "GET",
       path: "/v1/ops/schema",
       params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
 
@@ -48,7 +48,7 @@ export class SchemaNamespace {
       method: "POST",
       path: "/v1/ops/schema/refresh",
       params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err<void>(error);
     return ok(undefined as undefined);
