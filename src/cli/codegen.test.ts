@@ -331,6 +331,50 @@ describe("generateTypes", () => {
   });
 });
 
+describe("generateTypes with names that are not identifiers", () => {
+  const col = (name: string) => ({ name, type: "String", is_nullable: false, has_default: false });
+
+  it("quotes table and column names that are not bare identifiers", () => {
+    const out = generateTypes([
+      { name: "my-table", columns: [col("user-id"), col("2fa"), col("order id"), col("plain")] },
+    ]);
+    expect(out).toContain('"my-table": MyTableRow;');
+    expect(out).toContain('  "user-id": string;');
+    expect(out).toContain('  "2fa": string;');
+    expect(out).toContain('  "order id": string;');
+    expect(out).toContain("  plain: string;");
+  });
+
+  it("keeps a hostile name from adding declarations", () => {
+    const out = generateTypes([
+      { name: "t", columns: [col("x: string; }\nexport const evil = 1; {")] },
+    ]);
+    expect(out).not.toMatch(/^export const evil/m);
+    // One interface per table plus Database, no more.
+    expect(out.match(/^export interface /gm)).toHaveLength(2);
+  });
+
+  it("gives tables that differ only in case distinct interface names", () => {
+    const out = generateTypes([
+      { name: "user_events", columns: [col("a")] },
+      { name: "USER_EVENTS", columns: [col("b")] },
+    ]);
+    const names = [...out.matchAll(/^export interface (\w+) \{/gm)].map((m) => m[1]);
+    expect(names).toHaveLength(3);
+    expect(new Set(names).size).toBe(3);
+  });
+
+  it("emits a valid interface name for a name that starts with a digit or has no letters", () => {
+    const out = generateTypes([
+      { name: "2024_logs", columns: [col("a")] },
+      { name: "--", columns: [col("a")] },
+    ]);
+    for (const m of out.matchAll(/^export interface (\S+) \{/gm)) {
+      expect(m[1]).toMatch(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
+    }
+  });
+});
+
 describe("chTypeToTS", () => {
   it.each([
     ["String", "string"],

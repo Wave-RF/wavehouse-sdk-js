@@ -335,21 +335,21 @@ function generateTypes(schemas: TableSchema[]): string {
   // Code-unit comparison, not localeCompare: db.d.ts is a committed artifact,
   // so its ordering must not vary with the generating host's ICU locale.
   const tables = [...schemas].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const rowTypes = rowTypeNames(tables);
   for (const table of tables) {
-    lines.push(`  ${table.name}: ${pascalCase(table.name)}Row;`);
+    lines.push(`  ${propertyKey(table.name)}: ${rowTypes.get(table.name)};`);
   }
   lines.push("}");
   lines.push("");
 
   // Generate row interfaces
   for (const table of tables) {
-    const rowType = `${pascalCase(table.name)}Row`;
-    lines.push(`export interface ${rowType} {`);
+    lines.push(`export interface ${rowTypes.get(table.name)} {`);
 
     for (const col of table.columns) {
       const tsType = chTypeToTS(col.type);
       const optional = col.has_default ? "?" : "";
-      lines.push(`  ${col.name}${optional}: ${tsType};`);
+      lines.push(`  ${propertyKey(col.name)}${optional}: ${tsType};`);
     }
 
     lines.push("}");
@@ -359,11 +359,40 @@ function generateTypes(schemas: TableSchema[]): string {
   return lines.join("\n");
 }
 
+/**
+ * A schema name as a property key: bare when it is an identifier, else a
+ * string literal. Names come off the wire, so quoting also keeps a name from
+ * writing declarations of its own into the file.
+ */
+function propertyKey(name: string): string {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name : JSON.stringify(name);
+}
+
 function pascalCase(s: string): string {
   return s
-    .split(/[_\-\s]+/)
+    .split(/[^A-Za-z0-9]+/)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join("");
+}
+
+/**
+ * One valid, distinct `...Row` interface name per table. Case-sensitive
+ * ClickHouse allows `user_events` and `USER_EVENTS` side by side, and
+ * pascalCase folds both to `UserEvents`, so a repeat gets a numeric suffix.
+ * Tables arrive sorted, which keeps the choice stable between runs.
+ */
+function rowTypeNames(tables: TableSchema[]): Map<string, string> {
+  const names = new Map<string, string>();
+  const taken = new Set<string>();
+  for (const table of tables) {
+    // A leading digit or an all-symbol name is not an identifier on its own.
+    const base = `T${pascalCase(table.name)}`.replace(/^T(?=[A-Za-z_])/, "");
+    let name = `${base}Row`;
+    for (let n = 2; taken.has(name); n++) name = `${base}${n}Row`;
+    taken.add(name);
+    names.set(table.name, name);
+  }
+  return names;
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
