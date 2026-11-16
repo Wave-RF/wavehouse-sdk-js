@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chTypeToTS, fetchSchemas, generateTypes, parseArgs } from "./codegen.js";
+import {
+  chTypeToTS,
+  fetchSchemas,
+  generateTypes,
+  parseArgs,
+  resolveCredentials,
+} from "./codegen.js";
 
 // The server's /v1/ops/schema wire shape: a JSON ARRAY of tables (Go
 // SchemaRegistry.List() → []TableSchema), not a name-keyed map. Regression
@@ -167,6 +173,7 @@ describe("parseArgs", () => {
       url: "http://wh:8080",
       out: "./db.d.ts",
       auth: "tok",
+      authFromArgv: true,
       operatorKey: "op-key",
       tenant: "acme",
     });
@@ -180,7 +187,7 @@ describe("parseArgs", () => {
     ["--tenant", "-t"],
     ["--operator-key", "-k"],
   ];
-  const everyFlag = [...valueFlags.flat(), "--help", "-h"];
+  const everyFlag = [...valueFlags.flat(), "--auth-stdin", "--help", "-h"];
 
   // An unset shell variable is how a flag loses its value: quoted it leaves
   // "", unquoted it lets the flag after it slide into the value's place
@@ -205,6 +212,71 @@ describe("parseArgs", () => {
     expect(parseArgs(argv("-t", "-acme", "-k", "-x9_Tq"))).toMatchObject({
       tenant: "-acme",
       operatorKey: "-x9_Tq",
+    });
+  });
+});
+
+describe("resolveCredentials", () => {
+  const noStdin = async () => {
+    throw new Error("stdin must not be read");
+  };
+  const parse = (...flags: string[]) => parseArgs(["node", "codegen.ts", ...flags]);
+
+  it("reads the admin token from WAVEHOUSE_ADMIN_TOKEN without warning", async () => {
+    const warn = vi.fn();
+    const creds = await resolveCredentials(
+      parse(),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      noStdin,
+      warn,
+    );
+    expect(creds.auth).toBe("env-tok");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("reads the token from stdin for --auth-stdin", async () => {
+    const creds = await resolveCredentials(
+      parse("--auth-stdin"),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      async () => "stdin-tok",
+      vi.fn(),
+    );
+    expect(creds.auth).toBe("stdin-tok");
+  });
+
+  it("refuses an empty stdin token and --auth-stdin together with --auth", async () => {
+    await expect(
+      resolveCredentials(parse("--auth-stdin"), {}, async () => "", vi.fn()),
+    ).rejects.toThrow(/empty token/);
+    await expect(
+      resolveCredentials(parse("--auth-stdin", "--auth", "t"), {}, async () => "x", vi.fn()),
+    ).rejects.toThrow(/alternatives/);
+  });
+
+  it("still honours --auth, and says it is deprecated", async () => {
+    const warn = vi.fn();
+    const creds = await resolveCredentials(
+      parse("--auth", "argv-tok"),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      noStdin,
+      warn,
+    );
+    expect(creds.auth).toBe("argv-tok");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/--auth is deprecated/));
+  });
+
+  it("takes the operator key from the flag, else WAVEHOUSE_OPERATOR_KEY", async () => {
+    const env = { WAVEHOUSE_OPERATOR_KEY: "env-key" };
+    expect((await resolveCredentials(parse(), env, noStdin, vi.fn())).operatorKey).toBe("env-key");
+    expect(
+      (await resolveCredentials(parse("-k", "flag-key"), env, noStdin, vi.fn())).operatorKey,
+    ).toBe("flag-key");
+  });
+
+  it("sends no credential when none is given", async () => {
+    expect(await resolveCredentials(parse(), {}, noStdin, vi.fn())).toEqual({
+      auth: undefined,
+      operatorKey: undefined,
     });
   });
 });

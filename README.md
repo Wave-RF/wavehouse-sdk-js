@@ -150,7 +150,7 @@ Generate TypeScript types from your live WaveHouse schema. The package ships a `
 npx wavehouse-codegen --url http://localhost:8080 --out ./src/db.d.ts
 ```
 
-This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, and outputs a `Database` interface you can pass to `createClient<Database>()`. `/v1/ops/schema` is **admin-only** — pass an admin-role token with `--auth <jwt>` (or `-a`) against any non-dev policy. Over a nested settings directory the route admits the operator key alone: pass it with `--operator-key <key>` (or `-k`) and name the tenant with `--tenant <id>` (or `-t`); without `--tenant` it reads tenant `0`'s schema.
+This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, and outputs a `Database` interface you can pass to `createClient<Database>()`. `/v1/ops/schema` is **admin-only** — pass an admin-role token against any non-dev policy, in the `WAVEHOUSE_ADMIN_TOKEN` environment variable or on stdin with `--auth-stdin`. `--auth <jwt>` (or `-a`) still works but is deprecated, because an argument shows in the process list and shell history. Over a nested settings directory the route admits the operator key alone: pass it with `--operator-key <key>` (or `-k`, or `WAVEHOUSE_OPERATOR_KEY`) and name the tenant with `--tenant <id>` (or `-t`); without `--tenant` it reads tenant `0`'s schema.
 
 ## Development & Testing
 
