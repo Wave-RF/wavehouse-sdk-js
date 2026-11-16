@@ -185,7 +185,7 @@ describe("stream", () => {
 
   it("delivers a row ingested while an early reconnect was backing off", async () => {
     // Drop the first stream connection once it is live and before any event,
-    // so the reconnect has no Last-Event-ID and only the connection's own
+    // so the reconnect has no event id and only the connection's own
     // start to resume from.
     let drop: (() => void) | undefined;
     let streams = 0;

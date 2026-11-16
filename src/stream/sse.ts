@@ -103,7 +103,7 @@ interface AttemptResult {
  * Replaces `EventSource`, which cannot set request headers — the reason the JWT
  * used to ride in `?token=`, where it crossed every intermediary in the request
  * URI. In exchange for the `Authorization` header this owns what `EventSource`
- * used to provide: framing, reconnect, and `Last-Event-ID` resumption.
+ * used to provide: framing, reconnect, and resumption from the last event id.
  */
 export class SSETransport<T = Record<string, unknown>> implements StreamTransport<T> {
   private _opts: SSEOptions;
@@ -122,7 +122,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   private _started = false;
   private _counted = false;
   /**
-   * Most recent non-empty event id, replayed as `Last-Event-ID` on reconnect.
+   * Most recent non-empty event id, sent as `since` on reconnect.
    *
    * Deliberately ignores empty ids. The server emits a blank `id:` line for
    * passthrough payloads, and per the SSE spec an empty `id` field *clears* the
@@ -455,7 +455,10 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       );
     }
     url.searchParams.set("table", this._opts.table);
-    const since = this._opts.since || this._resumeSince;
+    // The last event id is the server's own `received_timestamp`, which is what
+    // `since` takes, so it outranks the caller's initial window and the
+    // connection-start fallback once there is something to resume from.
+    const since = this._lastEventId || this._opts.since || this._resumeSince;
     if (since) {
       url.searchParams.set("since", since);
     }
@@ -476,11 +479,11 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       }
     }
 
-    // Takes precedence over `since` server-side, so the initial window stays on
-    // the URL and resumption rides the header once there's something to resume.
-    if (this._lastEventId) {
-      base["Last-Event-ID"] = this._lastEventId;
-    }
+    // Resumption rides the `since` query parameter (see `_url`), not a
+    // `Last-Event-ID` header: that header is not CORS-safelisted, so on a
+    // cross-origin reconnect it forces a preflight a fronting proxy may reject,
+    // and every later attempt would then fail the same way forever (#26). The
+    // server reads an event id and `since` as the same timestamp.
 
     // Anything a redirect target must not be handed: the bearer token, or the
     // configured headers that carry proxy service-token secrets.

@@ -597,7 +597,8 @@ describe("SSETransport reconnect and resumption", () => {
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
 
-    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:03Z");
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:03Z");
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
     expect(headersOf(f.attempts[1]).Authorization).toBe("Bearer token-2");
     expect(seen.statuses).toContain("reconnecting");
 
@@ -824,7 +825,8 @@ describe("SSETransport reconnect and resumption", () => {
 
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
-    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:09Z");
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
 
     t.disconnect();
   });
@@ -859,6 +861,35 @@ describe("SSETransport reconnect and resumption", () => {
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts.length).toBeGreaterThan(1));
 
+    t.disconnect();
+  });
+
+  it("reconnects through a proxy whose CORS preflight rejects Last-Event-ID", async () => {
+    // A cross-origin fetch carrying a non-safelisted header preflights; model a
+    // proxy that answers the preflight without allowing it as a rejected fetch.
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const urls: string[] = [];
+    let call = 0;
+    const impl: FetchLike = async (url, init) => {
+      urls.push(url);
+      if ("Last-Event-ID" in ((init?.headers ?? {}) as Record<string, string>)) {
+        throw new TypeError("CORS preflight failed");
+      }
+      return call++ === 0 ? first.res : second.res;
+    };
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(urls).toHaveLength(1));
+    first.push(rowFrames("2026-08-01T00:00:09Z", "2026-08-01T00:00:09Z", { n: 1 }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(urls).toHaveLength(2));
+    second.push(rowFrames("2026-08-01T00:00:10Z", "2026-08-01T00:00:10Z", { n: 2 }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+    expect(seen.errors).toEqual([]);
     t.disconnect();
   });
 
@@ -1568,7 +1599,7 @@ describe("SSETransport early reconnect", () => {
     t.disconnect();
   });
 
-  it("keeps the caller's since, and prefers Last-Event-ID once an event arrived", async () => {
+  it("keeps the caller's since, and resumes from the last event id once one arrived", async () => {
     const f = makeFetch();
     const first = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
     f.queue.push(() => first.res);
@@ -1600,7 +1631,8 @@ describe("SSETransport early reconnect", () => {
     one.close();
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(g.attempts).toHaveLength(2));
-    expect(headersOf(g.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
+    expect(new URL(g.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:09Z");
+    expect(headersOf(g.attempts[1])["Last-Event-ID"]).toBeUndefined();
     t2.disconnect();
   });
 });

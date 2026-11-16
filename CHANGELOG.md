@@ -11,5 +11,6 @@
 - A subscriber that registers after a stream ended on a terminal error now receives that error, so it learns why the stream closed rather than only that it did. Fixes #36.
 - A retried request no longer leaves an abort listener on the caller's `AbortSignal` each time its backoff timer wins, which tripped Node's `MaxListenersExceededWarning` on a signal shared across many requests. Fixes #29.
 - A stream that takes a `429 Too Many Requests` now re-dials instead of staying dead until a reload (unless the body says `retryable: false`); every other 4xx still ends it. A `Retry-After` on a retryable stream response, in seconds or as an HTTP-date, sets the floor for that wait, clamped to 30 s. Fixes #25 and the stream half of #43.
+- A reconnecting stream resumes with `?since=<last event id>` instead of a `Last-Event-ID` header. The header is not CORS-safelisted, so behind a proxy that answers CORS without allowing it, every reconnect failed its preflight and the stream re-dialed forever; a query parameter never preflights, and the server reads both the same way. Fixes #26.
 
 Releases up to 0.2.0 are recorded in the [WaveHouse changelog](https://github.com/Wave-RF/WaveHouse/blob/main/CHANGELOG.md).
