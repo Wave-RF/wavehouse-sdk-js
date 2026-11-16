@@ -1099,12 +1099,20 @@ describe("SSETransport reconnect and resumption", () => {
       expect(counts[0]).toBe(1);
     });
 
-    it.each([400, 401, 403, 404, 405, 408, 410, 413])("keeps a %i terminal", async (status) => {
+    it.each([400, 401, 403, 404, 405, 410, 413])("keeps a %i terminal", async (status) => {
       const { counts } = await attemptsAfter(
         () => new Response("{}", { status, headers: { "Retry-After": "1" } }),
         [60_000],
       );
       expect(counts[0]).toBe(1);
+    });
+
+    it("re-dials a 408, which is retryable", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 408, headers: { "Retry-After": "20" } }),
+        [19_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
     });
 
     it("waits Retry-After seconds before re-dialing a 429", async () => {

@@ -174,10 +174,10 @@ export interface ClientOptions {
   attemptTimeoutMs?: number;
   /**
    * Longest `Retry-After` wait, in milliseconds, a REST call will sit through
-   * before retrying a 503 (or a 429 on a pipe call). When the server asks for
-   * more, the call returns that response as its error instead of sleeping.
-   * `Retry-After` may be seconds or an HTTP-date. Default: 30000, the backoff
-   * ceiling.
+   * before resending. It applies to any retryable answer (5xx, 408, 429) the
+   * call may resend; when the server asks for more, the wait is clamped to this
+   * and the call retries while attempts remain. `Retry-After` may be seconds or
+   * an HTTP-date. Default: 30000, the backoff ceiling.
    */
   maxRetryAfterMs?: number;
   /**

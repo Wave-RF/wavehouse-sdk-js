@@ -71,6 +71,10 @@ describe("resend safety by call kind", () => {
       const { calls } = await run("sql", () => json(status, {}, { "Retry-After": "1" }), ok);
       expect(calls).toBe(1);
     });
+    it("does not resend a 408", async () => {
+      const { calls } = await run("sql", () => json(408, {}), ok);
+      expect(calls).toBe(1);
+    });
     it("does not resend when the server says retryable", async () => {
       const { calls } = await run("sql", () => json(503, { retryable: true }), ok);
       expect(calls).toBe(1);
@@ -82,6 +86,10 @@ describe("resend safety by call kind", () => {
       const { result, calls } = await run("pipe", () => json(status, {}), ok);
       expect(calls).toBe(1);
       expect(result.error?.status).toBe(status);
+    });
+    it("does not resend a 408", async () => {
+      const { calls } = await run("pipe", () => json(408, {}), ok);
+      expect(calls).toBe(1);
     });
     it("does not resend a bare 503 without Retry-After", async () => {
       const { calls } = await run("pipe", () => new Response("", { status: 503 }), ok);
@@ -131,6 +139,10 @@ describe("resend safety by call kind", () => {
     it("does not resend a 4xx", async () => {
       const { calls } = await run("read", () => json(400, {}), ok);
       expect(calls).toBe(1);
+    });
+    it("resends a 408, which is retryable", async () => {
+      const { calls } = await run("read", () => json(408, {}), ok);
+      expect(calls).toBe(2);
     });
     it("resends a 429, which is retryable", async () => {
       const { calls } = await run("read", () => json(429, {}, { "Retry-After": "1" }), ok);

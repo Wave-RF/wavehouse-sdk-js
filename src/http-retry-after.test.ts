@@ -76,31 +76,50 @@ describe("Retry-After in request()", () => {
     expect((await p).error).toBeNull();
   });
 
-  it("returns the server's answer instead of sleeping past the cap", async () => {
-    const result = await start(answer503("3600"));
+  it("clamps a Retry-After above the cap to it and retries", async () => {
+    const p = start(answer503("3600"));
+    await vi.advanceTimersByTimeAsync(29_999);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((await p).error).toBeNull();
+  });
+
+  it("applies the same clamp to an HTTP-date", async () => {
+    const p = start(answer503("Thu, 29 Oct 2026 14:00:00 GMT"));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((await p).error).toBeNull();
+  });
+
+  it("returns the server's answer once the attempts are spent, after waiting the clamp", async () => {
+    fetchSpy.mockReset();
+    fetchSpy.mockImplementation(async () => answer503("3600")());
+    const p = request(ctx(), { method: "GET", path: "/x" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    const result = await p;
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(result.error?.status).toBe(503);
     expect(result.error?.message).toBe("busy");
   });
 
-  it("applies the same cap to an HTTP-date", async () => {
-    const result = await start(answer503("Thu, 29 Oct 2026 14:00:00 GMT"));
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(result.error?.status).toBe(503);
-  });
-
   it("honours a configured maxRetryAfterMs, up and down", async () => {
-    // Raised: a 60 s ask is waited out.
+    // Raised: a 60 s ask is waited out in full.
     const waited = start(answer503("60"), 120_000);
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect((await waited).error).toBeNull();
 
-    // Lowered: a 5 s ask is refused.
+    // Lowered: a 5 s ask is shortened to 1 s.
     fetchSpy.mockReset();
-    const refused = await start(answer503("5"), 1000);
+    const clamped = start(answer503("5"), 1000);
+    await vi.advanceTimersByTimeAsync(999);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(refused.error?.status).toBe(503);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((await clamped).error).toBeNull();
   });
 
   it("jitters the wait but never below what the server asked", async () => {
@@ -113,16 +132,19 @@ describe("Retry-After in request()", () => {
     expect((await p).error).toBeNull();
   });
 
-  it("applies the cap to a pipe call's 429 too", async () => {
-    fetchSpy.mockImplementation(
-      async () => new Response("{}", { status: 429, headers: { "Retry-After": "3600" } }),
-    );
-    const result = await request(ctx(), { method: "POST", path: "/x", body: {}, kind: "pipe" });
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(result.error?.status).toBe(429);
+  it("clamps a pipe call's 429 the same way", async () => {
+    fetchSpy
+      .mockImplementationOnce(
+        async () => new Response("{}", { status: 429, headers: { "Retry-After": "3600" } }),
+      )
+      .mockImplementationOnce(async () => ok());
+    const p = request(ctx(), { method: "POST", path: "/x", body: {}, kind: "pipe" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((await p).error).toBeNull();
   });
 
-  it("honors Retry-After on a read's 429 and caps it", async () => {
+  it("honors Retry-After on a read's 429 and clamps it", async () => {
     const answer429 = (retryAfter: string) => () =>
       new Response("{}", { status: 429, headers: { "Retry-After": retryAfter } });
     fetchSpy
@@ -136,10 +158,39 @@ describe("Retry-After in request()", () => {
     expect((await p).error).toBeNull();
 
     fetchSpy.mockReset();
-    fetchSpy.mockImplementation(async () => answer429("3600")());
-    const refused = await request(ctx(), { method: "GET", path: "/x" });
+    fetchSpy
+      .mockImplementationOnce(async () => answer429("3600")())
+      .mockImplementation(async () => ok());
+    const long = request(ctx(), { method: "GET", path: "/x" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((await long).error).toBeNull();
+  });
+
+  it("waits Retry-After on any retryable status, 500 and 408 included", async () => {
+    for (const status of [500, 408]) {
+      fetchSpy.mockReset();
+      fetchSpy
+        .mockImplementationOnce(
+          async () => new Response("{}", { status, headers: { "Retry-After": "7" } }),
+        )
+        .mockImplementation(async () => ok());
+      const p = request(ctx(), { method: "GET", path: "/x" });
+      await vi.advanceTimersByTimeAsync(6999);
+      expect(fetchSpy, `status ${status}`).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchSpy, `status ${status}`).toHaveBeenCalledTimes(2);
+      expect((await p).error).toBeNull();
+    }
+  });
+
+  it("does not retry a 4xx that carries Retry-After", async () => {
+    fetchSpy.mockImplementation(
+      async () => new Response("{}", { status: 400, headers: { "Retry-After": "1" } }),
+    );
+    const result = await request(ctx(), { method: "GET", path: "/x" });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(refused.error?.status).toBe(429);
+    expect(result.error?.status).toBe(400);
   });
 
   it("never resends raw SQL after a 429", async () => {

@@ -398,29 +398,19 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         return { data: null, error, headers: res.headers };
       }
 
-      // The server's own wait, from Retry-After, for the answers that carry one:
-      // a 429 the server has not marked `retryable: false`, and any 503. A raw
-      // SQL statement never gets here (see `mayResendResponse`).
-      const mayWait = (res.status === 429 && error.retryable) || res.status === 503;
-      const retryAfter = res.headers.get("Retry-After");
-      if (mayWait && (res.status === 429 || retryAfter) && attempt < maxAttempts - 1) {
-        const wait = parseRetryAfter(retryAfter, Date.now());
-        const cap = ctx.options.maxRetryAfterMs ?? MAX_BACKOFF_MS;
-        // Sleeping an hour inside a call the caller thinks is short is worse
-        // than handing back the server's answer.
-        if (wait !== undefined && wait > cap) {
-          return { data: null, error, headers: res.headers };
-        }
-        guard.dispose();
-        await sleep(wait === undefined ? backoff(attempt) : jitter(wait), opts.signal);
-        lastError = error;
-        continue;
-      }
-
-      // Retryable server errors (5xx)
+      // Retryable answers (5xx, 408, 429, or what the server marks retryable)
+      // wait the server's `Retry-After` when it sends one, clamped to
+      // `maxRetryAfterMs`, as `wavehouse-sdk-go` does: a long ask is shortened,
+      // not turned into an error. Calls that may have written never get here
+      // unless `mayResendResponse` said so.
       if (error.retryable && attempt < maxAttempts - 1) {
+        const asked = parseRetryAfter(res.headers.get("Retry-After"), Date.now());
+        const cap = ctx.options.maxRetryAfterMs ?? MAX_BACKOFF_MS;
         guard.dispose();
-        await sleep(backoff(attempt), opts.signal);
+        await sleep(
+          asked === undefined ? backoff(attempt) : jitter(Math.min(asked, cap)),
+          opts.signal,
+        );
         lastError = error;
         continue;
       }
