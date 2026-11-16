@@ -98,9 +98,28 @@ jobs:
       # Also loads the build at the oldest Node engines.node admits, whichever Node runs this job.
       - run: make smoke
 
+  # Needs Docker, which ubuntu-latest has: the job starts ClickHouse and the server's rolling dev image.
+  live:
+    name: Live tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          run_install: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:e2e
+
   ci:
     name: CI
-    needs: [shared, lint, typecheck, test, build]
+    needs: [shared, lint, typecheck, test, build, live]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
