@@ -206,7 +206,7 @@ Unit tests mock all HTTP calls — no backend required.
 ```bash
 pnpm test               # run unit tests (no backend needed)
 pnpm run test:watch     # watch mode
-pnpm run test:coverage  # coverage report, gated at a 40% statement floor
+pnpm run test:coverage  # coverage report, gated at an 87% statement floor
 ```
 
 ### Built Package Smoke Check
