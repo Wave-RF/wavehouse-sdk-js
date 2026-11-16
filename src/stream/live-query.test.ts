@@ -276,6 +276,52 @@ describe("parseInstant", () => {
   });
 });
 
+describe("liveQuery dedup compares the column when the event carries it", () => {
+  async function run(rows: Record<string, unknown>[], events: StreamEvent[]) {
+    const { t, stream } = manualStream();
+    const seen: number[] = [];
+    new LiveQuery(
+      stream,
+      async () => ({ ok: true, data: rows, error: null }) as Result<Record<string, unknown>[]>,
+      { next: (e) => seen.push(e.data.n as number) },
+    );
+    for (const e of events) t.fire(e);
+    await new Promise((r) => setTimeout(r, 10));
+    return seen;
+  }
+  const withCol = (frameTs: string, col: unknown, n: number): StreamEvent => ({
+    table: "t",
+    timestamp: frameTs,
+    data: { n, received_timestamp: col },
+  });
+
+  it("delivers an event whose frame time is old but whose column is newer than the rows", async () => {
+    // The insert time (column) runs after the frame time, so by the frame clock
+    // alone this event looks covered by the fetch and would be dropped.
+    const seen = await run(
+      [{ received_timestamp: "2026-01-01T00:00:05Z" }],
+      [withCol("2026-01-01T00:00:04Z", "2026-01-01T00:00:05.500Z", 1)],
+    );
+    expect(seen).toEqual([1]);
+  });
+
+  it("drops an event whose column is covered even though its frame time is later", async () => {
+    const seen = await run(
+      [{ received_timestamp: "2026-01-01T00:00:05Z" }],
+      [withCol("2026-01-01T00:00:09Z", "2026-01-01T00:00:05Z", 1)],
+    );
+    expect(seen).toEqual([]);
+  });
+
+  it("falls back to the frame time when the column is null", async () => {
+    const seen = await run(
+      [{ received_timestamp: "2026-01-01T00:00:05Z" }],
+      [withCol("2026-01-01T00:00:04Z", null, 1), withCol("2026-01-01T00:00:06Z", null, 2)],
+    );
+    expect(seen).toEqual([2]);
+  });
+});
+
 describe("liveQuery through the client", () => {
   /** A fetch that answers the backfill when `release()` is called and keeps the stream open. */
   function gatedFetch() {

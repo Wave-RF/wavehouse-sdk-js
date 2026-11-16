@@ -125,9 +125,15 @@ export class LiveQuery<T = Record<string, unknown>> {
     this._buffer = [];
     for (const event of buffered) {
       if (this._closed) break;
-      // An event whose own timestamp won't parse can't be proven covered, so it
-      // is delivered rather than dropped.
-      const at = parseInstant(event.timestamp);
+      // Compare like with like. The frame's timestamp is when WaveHouse received
+      // the event; the table's `received_timestamp` column can be the later
+      // ClickHouse insert time, so when the event's own row carries that column
+      // it is compared to the fetched rows' column, and only otherwise is the
+      // frame's timestamp used (best effort: see `QueryBuilder.liveQuery`). An
+      // event whose timestamp won't parse can't be proven covered, so it is
+      // delivered rather than dropped.
+      const column = (event.data as Record<string, unknown> | null | undefined)?.received_timestamp;
+      const at = column != null ? parseInstant(column) : parseInstant(event.timestamp);
       if (boundary !== undefined && at !== undefined && at <= boundary) {
         continue; // already covered by the fetch
       }

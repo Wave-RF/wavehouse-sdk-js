@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- `liveQuery` compares like with like when it deduplicates. A buffered event whose own row carries a non-null `received_timestamp` is compared to the fetched rows by that column; the frame's timestamp (when WaveHouse received the event, earlier than a `DEFAULT now64()` insert time) is used only when the row has no such column. Deduplication stays best-effort until the server gives a read watermark (Wave-RF/WaveHouse#951), and `liveQuery` says so. The unused filters argument of `LiveQuery` is gone.
 - `liveQuery`'s backfill request now carries the subscription's `StreamOptions`: `headers` (an `X-Tenant-ID` reached the stream but not `/v1/query`), `attemptTimeoutMs` and `signal`. An aborted `signal` ends the live query like `close()`, so `initial()` and `next()` are never called after it, including by a backfill still in flight.
 - A `baseURL` that names no host throws a `TypeError` at construction. A bare path such as `/api/warehouse` used to normalise to `https:///api/warehouse`, which reads as the host `api`, so every call went to the wrong server. `/`, `//`, `https:///x` and an empty base are refused the same way.
 - `options.maxRetries` is validated at construction: a negative, fractional or non-finite value throws a `TypeError` naming it. A negative count used to make a call return neither data nor an error, so `.fetch()` threw a `TypeError` on `null`. `wavehouse-sdk-go` rejects the same values in `New`.

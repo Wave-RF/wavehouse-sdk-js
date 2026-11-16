@@ -303,10 +303,16 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
    * an aborted `signal` ends the live query: neither `initial()` nor `next()`
    * is called afterwards.
    *
-   * Events that arrived during the fetch are deduplicated and flushed
-   * automatically, against the newest `received_timestamp` among the fetched
-   * rows. A table without that column, or a `.select()` that drops it, has
-   * nothing to deduplicate against.
+   * **De-duplication is best-effort.** Events that arrived during the fetch are
+   * dropped when they are covered by it, judged against the newest
+   * `received_timestamp` among the fetched rows. When an event's own row carries
+   * a `received_timestamp` column, the two columns are compared. Otherwise the
+   * frame's timestamp, when WaveHouse received the event, stands in for it, and
+   * a table whose column is the later insert time (`DEFAULT now64()`) can then
+   * repeat a row already in `initial()` or drop one that is not. A table without
+   * the column, or a `.select()` that drops it, has nothing to compare against.
+   * It stays best-effort until the server gives a read watermark
+   * (Wave-RF/WaveHouse#951).
    *
    * Returns a LiveQuery handle with a `.close()` method.
    */
