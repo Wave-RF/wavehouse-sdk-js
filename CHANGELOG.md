@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- `liveQuery`'s backfill request now carries the subscription's `StreamOptions`: `headers` (an `X-Tenant-ID` reached the stream but not `/v1/query`), `attemptTimeoutMs` and `signal`. An aborted `signal` ends the live query like `close()`, so `initial()` and `next()` are never called after it, including by a backfill still in flight.
 - A `baseURL` that names no host throws a `TypeError` at construction. A bare path such as `/api/warehouse` used to normalise to `https:///api/warehouse`, which reads as the host `api`, so every call went to the wrong server. `/`, `//`, `https:///x` and an empty base are refused the same way.
 - `options.maxRetries` is validated at construction: a negative, fractional or non-finite value throws a `TypeError` naming it. A negative count used to make a call return neither data nor an error, so `.fetch()` threw a `TypeError` on `null`. `wavehouse-sdk-go` rejects the same values in `New`.
 - A `200` whose body is not JSON (an intermediary's HTML page, say) returns a non-retryable `DECODE_ERROR` carrying the status, and the request is sent once. It used to be classed as a `NETWORK_ERROR` and retried, a write included. `wavehouse-sdk-go` already behaved this way.

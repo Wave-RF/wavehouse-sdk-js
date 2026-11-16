@@ -298,18 +298,29 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
    * Start a live query: fetches historical data, then streams live updates.
    *
    * The subscriber's `initial()` is called once with the fetch result, then
-   * `next()` fires for each live event. Events that arrived during the fetch
-   * are deduplicated and flushed automatically, against the newest
-   * `received_timestamp` among the fetched rows. A table without that column,
-   * or a `.select()` that drops it, has nothing to deduplicate against: events
-   * that arrived during the fetch may then repeat rows already in `initial()`.
+   * `next()` fires for each live event. `opts.headers`, `opts.attemptTimeoutMs`
+   * and `opts.signal` apply to the backfill request as well as the stream, and
+   * an aborted `signal` ends the live query: neither `initial()` nor `next()`
+   * is called afterwards.
+   *
+   * Events that arrived during the fetch are deduplicated and flushed
+   * automatically, against the newest `received_timestamp` among the fetched
+   * rows. A table without that column, or a `.select()` that drops it, has
+   * nothing to deduplicate against.
    *
    * Returns a LiveQuery handle with a `.close()` method.
    */
   liveQuery(subscriber: StreamSubscriber<Row>, opts?: StreamOptions): LiveQuery<Row> {
     const stream = this.stream(opts);
-    const fetchFn = () => this.fetch();
-    return new LiveQuery<Row>(stream, fetchFn, subscriber, this._state.filters);
+    // The backfill is one more request of this subscription, so it carries the
+    // same headers, deadline and signal: a tenant header must reach it too.
+    const fetchFn = () =>
+      this.fetch({
+        signal: opts?.signal,
+        headers: opts?.headers,
+        attemptTimeoutMs: opts?.attemptTimeoutMs,
+      });
+    return new LiveQuery<Row>(stream, fetchFn, subscriber, opts?.signal);
   }
 
   // --- PromiseLike implementation ---

@@ -1,4 +1,4 @@
-import type { QueryFilter, Result, StreamEvent, StreamSubscriber } from "../types.js";
+import type { Result, StreamEvent, StreamSubscriber } from "../types.js";
 import type { StreamController } from "./controller.js";
 
 /**
@@ -39,15 +39,25 @@ export class LiveQuery<T = Record<string, unknown>> {
   private _buffering = true;
   private _unsubStream: (() => void) | null = null;
   private _closed = false;
+  private _signal: AbortSignal | undefined;
+  private _onAbort: (() => void) | undefined;
 
   constructor(
     stream: StreamController<T>,
     fetchFn: () => Promise<Result<T[]>>,
     subscriber: StreamSubscriber<T>,
-    _filters: QueryFilter[],
+    signal?: AbortSignal,
   ) {
     this._stream = stream;
     this._subscriber = subscriber;
+    // An abort ends the live query like `close()`: the backfill that is still
+    // running must not call `initial` or `next` afterwards.
+    if (signal) {
+      this._onAbort = () => this.close();
+      if (signal.aborted) this._closed = true;
+      else signal.addEventListener("abort", this._onAbort, { once: true });
+      this._signal = signal;
+    }
 
     // Step 1: Subscribe to live events and buffer them.
     this._unsubStream = stream.subscribe({
@@ -63,7 +73,13 @@ export class LiveQuery<T = Record<string, unknown>> {
       error: (e) => subscriber.error?.(e),
     });
 
-    // Step 2-5: Fetch historical and flush.
+    // Step 2-5: Fetch historical and flush. Not started for a signal that was
+    // aborted before the call: nothing may reach the subscriber then.
+    if (this._closed) {
+      this._unsubStream?.();
+      this._stream.close();
+      return;
+    }
     this._runBackfill(fetchFn);
   }
 
@@ -125,6 +141,7 @@ export class LiveQuery<T = Record<string, unknown>> {
 
   /** Close the live query and the underlying stream. */
   close(): void {
+    if (this._onAbort) this._signal?.removeEventListener("abort", this._onAbort);
     this._closed = true;
     this._buffering = false;
     this._buffer = [];

@@ -150,17 +150,12 @@ describe("liveQuery backfill isolation", () => {
     const seen: number[] = [];
     let release!: (r: Result<Record<string, unknown>[]>) => void;
     const fetchFn = () => new Promise<Result<Record<string, unknown>[]>>((r) => (release = r));
-    new LiveQuery(
-      stream,
-      fetchFn,
-      {
-        next: (e) => {
-          seen.push(e.data.n as number);
-          if (e.data.n === 1) throw new Error("boom");
-        },
+    new LiveQuery(stream, fetchFn, {
+      next: (e) => {
+        seen.push(e.data.n as number);
+        if (e.data.n === 1) throw new Error("boom");
       },
-      [],
-    );
+    });
     t.fire(ev("2026-01-01T00:00:01Z", 1));
     t.fire(ev("2026-01-01T00:00:02Z", 2));
     release({ ok: true, data: [], error: null } as Result<Record<string, unknown>[]>);
@@ -180,7 +175,6 @@ describe("liveQuery backfill isolation", () => {
         },
         next: (e) => seen.push(e.data.n as number),
       },
-      [],
     );
     t.fire(ev("2026-01-01T00:00:01Z", 1));
     await vi.waitFor(() => expect(seen).toEqual([1]));
@@ -199,7 +193,6 @@ describe("liveQuery backfill isolation", () => {
           error: { status: 500, code: "X", message: "m", retryable: false },
         }) as unknown as Result<Record<string, unknown>[]>,
       { initial, next: (e) => seen.push(e.data.n as number) },
-      [],
     );
     t.fire(ev("2026-01-01T00:00:01Z", 1));
     await vi.waitFor(() => expect(seen).toEqual([1]));
@@ -209,12 +202,9 @@ describe("liveQuery backfill isolation", () => {
   it("delivers buffered events when the fetch rejects", async () => {
     const { t, stream } = manualStream();
     const seen: number[] = [];
-    new LiveQuery(
-      stream,
-      () => Promise.reject(new Error("auth down")),
-      { next: (e) => seen.push(e.data.n as number) },
-      [],
-    );
+    new LiveQuery(stream, () => Promise.reject(new Error("auth down")), {
+      next: (e) => seen.push(e.data.n as number),
+    });
     t.fire(ev("2026-01-01T00:00:01Z", 1));
     await vi.waitFor(() => expect(seen).toEqual([1]));
   });
@@ -228,7 +218,6 @@ describe("liveQuery dedup boundary", () => {
       stream,
       async () => ({ ok: true, data: rows, error: null }) as Result<Record<string, unknown>[]>,
       { next: (e) => seen.push(e.data.n as number) },
-      [],
     );
     for (const e of events) t.fire(e);
     await new Promise((r) => setTimeout(r, 10));
@@ -284,5 +273,75 @@ describe("parseInstant", () => {
     expect(parseInstant("2026-01-01T00:00:00+0100")).toBe(parseInstant("2025-12-31T23:00:00Z"));
     expect(parseInstant(5)).toBeUndefined();
     expect(parseInstant("yesterday")).toBeUndefined();
+  });
+});
+
+describe("liveQuery through the client", () => {
+  /** A fetch that answers the backfill when `release()` is called and keeps the stream open. */
+  function gatedFetch() {
+    const calls: { url: string; init: RequestInit }[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const impl: FetchLike = async (url, init) => {
+      calls.push({ url, init: init ?? {} });
+      if (isStreamURL(url)) {
+        return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      await gate;
+      return new Response(JSON.stringify([{ received_timestamp: "2026-01-01T00:00:05Z" }]), {
+        status: 200,
+      });
+    };
+    return { impl, calls, release };
+  }
+
+  it("sends the subscription's headers on the backfill as well as the stream", async () => {
+    const f = gatedFetch();
+    const wh = createClient({ baseURL: "http://localhost:8080", options: { fetch: f.impl } });
+    const lq = wh
+      .from("clicks")
+      .selectAll()
+      .liveQuery({ next: () => {} }, { headers: { "X-Tenant-ID": "acme" } });
+    await vi.waitFor(() => expect(f.calls).toHaveLength(2));
+    for (const c of f.calls) {
+      expect((c.init.headers as Record<string, string>)["X-Tenant-ID"]).toBe("acme");
+    }
+    lq.close();
+    f.release();
+  });
+
+  it("never calls initial or next once the signal is aborted", async () => {
+    const f = gatedFetch();
+    const ac = new AbortController();
+    const wh = createClient({ baseURL: "http://localhost:8080", options: { fetch: f.impl } });
+    const initial = vi.fn();
+    const next = vi.fn();
+    wh.from("clicks").selectAll().liveQuery({ initial, next }, { signal: ac.signal });
+    await vi.waitFor(() => expect(f.calls).toHaveLength(2));
+    // The backfill's request got the signal, so an abort reaches it.
+    const backfill = f.calls.find((c) => !isStreamURL(c.url));
+    expect(backfill?.init.signal).toBeDefined();
+    ac.abort();
+    f.release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(initial).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("calls nothing for a signal that is already aborted", async () => {
+    const f = gatedFetch();
+    const ac = new AbortController();
+    ac.abort();
+    const wh = createClient({ baseURL: "http://localhost:8080", options: { fetch: f.impl } });
+    const initial = vi.fn();
+    wh.from("clicks")
+      .selectAll()
+      .liveQuery({ initial, next: () => {} }, { signal: ac.signal });
+    f.release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(initial).not.toHaveBeenCalled();
   });
 });
