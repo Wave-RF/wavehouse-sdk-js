@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-17
+
 ### Added
 
 - `options.attemptTimeoutMs` (default off) and a per-call `attemptTimeoutMs` give each attempt its own deadline, linked to the caller's `signal`, so a stalled attempt is retried instead of holding the call or, with `AbortSignal.timeout()`, aborting it with no retry. An attempt that hits it is retried after a backoff while `maxRetries` allows, with the safety rules of any network error: `wh.sql()` and pipe calls are not resent, since a timeout always counts as possibly sent. The caller's own abort still ends the call at once with `ABORTED`. A call that gives up returns `ATTEMPT_TIMEOUT` naming the attempt count. For `.stream()` and `.liveQuery()` it bounds each connect up to the response headers (`SSE_ATTEMPT_TIMEOUT`, retried), never an established stream; `StreamOptions` takes it too. Mirrors `RetryPolicy.AttemptTimeout` in `wavehouse-sdk-go`.
