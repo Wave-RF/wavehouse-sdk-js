@@ -24,6 +24,12 @@ export class StreamController<T = Record<string, unknown>> {
   private _iterated = false;
   /** A callback subscriber has registered, so events have a consumer without the buffer. */
   private _subscribed = false;
+  /**
+   * Most recent error since the stream last went live. Replayed to a subscriber
+   * that registers after the stream closed, which otherwise learns it is closed
+   * but never why.
+   */
+  private _lastError: WaveHouseError | null = null;
 
   constructor(transport: StreamTransport<T>) {
     this._transport = transport;
@@ -44,6 +50,7 @@ export class StreamController<T = Record<string, unknown>> {
     };
 
     this._transport.onStatus = (status) => {
+      if (status === "live") this._lastError = null;
       // Deduplicate: skip if status hasn't changed (e.g. transport fires
       // 'connecting' after StreamController already set it as the initial state).
       if (status === this._status) return;
@@ -54,6 +61,7 @@ export class StreamController<T = Record<string, unknown>> {
     };
 
     this._transport.onError = (error) => {
+      this._lastError = error;
       this._fanOut("error", (sub) => sub.error?.(error));
     };
 
@@ -162,6 +170,13 @@ export class StreamController<T = Record<string, unknown>> {
     } catch (e) {
       console.error("[wavehouse] subscriber status handler threw:", e);
     }
+    if (this._status === "closed" && this._lastError) {
+      try {
+        subscriber.error?.(this._lastError);
+      } catch (e) {
+        console.error("[wavehouse] subscriber error handler threw:", e);
+      }
+    }
 
     return () => {
       this._subscribers.delete(subscriber);
@@ -182,6 +197,8 @@ export class StreamController<T = Record<string, unknown>> {
 
   /** Close the stream and release resources. */
   close(): void {
+    // A close the caller asked for has no failure to explain to a late subscriber.
+    this._lastError = null;
     this._transport.disconnect();
     this._finish();
     if (this._status !== "closed") {

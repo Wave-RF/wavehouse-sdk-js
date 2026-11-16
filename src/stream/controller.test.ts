@@ -370,4 +370,55 @@ describe("StreamController", () => {
       await expect(p).resolves.toBeUndefined();
     });
   });
+
+  describe("a terminal error before subscribe()", () => {
+    const terminal: WaveHouseError = {
+      status: 400,
+      code: "HTTP_400",
+      message: "bad",
+      retryable: false,
+    };
+
+    it("is replayed to a subscriber that registers after the stream closed", async () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      t.fireError(terminal);
+      t.fireStatus("closed");
+      await Promise.resolve(); // any await between stream() and subscribe()
+      const error = vi.fn();
+      ctrl.subscribe({ next: () => {}, error });
+      expect(error).toHaveBeenCalledExactlyOnceWith(terminal);
+    });
+
+    it("reaches an early subscriber exactly once", () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      const error = vi.fn();
+      ctrl.subscribe({ next: () => {}, error });
+      t.fireError(terminal);
+      t.fireStatus("closed");
+      expect(error).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not replay an error the stream recovered from", () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      t.fireError({ ...terminal, status: 0, retryable: true });
+      t.fireStatus("live");
+      ctrl.close();
+      const error = vi.fn();
+      ctrl.subscribe({ next: () => {}, error });
+      expect(error).not.toHaveBeenCalled();
+    });
+
+    it("does not replay to a subscriber of a stream the caller closed", () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      t.fireError({ ...terminal, status: 0, retryable: true });
+      ctrl.close();
+      const error = vi.fn();
+      ctrl.subscribe({ next: () => {}, error });
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
 });
