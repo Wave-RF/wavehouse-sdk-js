@@ -209,6 +209,22 @@ describe("parseArgs", () => {
   });
 });
 
+describe("parseArgs unknown arguments", () => {
+  const argv = (...flags: string[]) => ["node", "codegen.ts", ...flags];
+
+  // Each of these used to parse cleanly and fall back to tenant 0 or no key.
+  it.each([
+    [["--tenat", "acme"]],
+    [["--tenant-id", "acme"]],
+    [["-T", "acme"]],
+    [["--tenant=acme"]],
+    [["acme"]],
+    [["--operator-ket", "k", "--tenant", "acme"]],
+  ])("refuses %j rather than skipping it", (flags) => {
+    expect(() => parseArgs(argv(...flags))).toThrow(/unknown argument/);
+  });
+});
+
 describe("generateTypes", () => {
   it("keys the Database interface by table name, sorted, from the wire-shape array", () => {
     const out = generateTypes(wireSchemas);

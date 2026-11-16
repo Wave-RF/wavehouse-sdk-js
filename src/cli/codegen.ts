@@ -92,6 +92,11 @@ Options:
                       (default: tenant 0)
   --help, -h          Show this help`);
         process.exit(0);
+        break;
+      default:
+        // A mistyped --tenant must not read as an absent one: that falls back
+        // to tenant 0 and writes the wrong tenant's types with exit 0.
+        throw new Error(`unknown argument ${JSON.stringify(argv[i])}; see --help`);
     }
   }
   return args;
