@@ -19,7 +19,7 @@ import type {
   StreamOptions,
   VersionInfo,
 } from "./types.js";
-import { assertBaseHasHost } from "./url.js";
+import { assertBaseHasHost, assertBaseScheme } from "./url.js";
 
 type TableName<DB> = DB extends Database ? Extract<keyof DB, string> : string;
 type RowType<DB, T extends string> = DB extends Database
@@ -54,6 +54,7 @@ export class WaveHouseClient<DB extends Database = Database> {
     // Refused here, not on the first call: a base that names no host (a bare
     // path such as "/api") would otherwise read as one.
     assertBaseHasHost(config.baseURL);
+    assertBaseScheme(config.baseURL);
     // A negative or fractional count would make the retry loop run zero times.
     const maxRetries = config.options?.maxRetries;
     if (maxRetries !== undefined && (!Number.isInteger(maxRetries) || maxRetries < 0)) {
@@ -82,7 +83,7 @@ export class WaveHouseClient<DB extends Database = Database> {
   }
 
   /**
-   * The server's build metadata, from `GET /version`. Needs no tenant.
+   * The server's build metadata, from `GET /version`.
    */
   async version(opts?: CallOptions): Promise<Result<VersionInfo>> {
     const { data, error } = await request<VersionInfo>(this._ctx, {
@@ -115,9 +116,7 @@ export class WaveHouseClient<DB extends Database = Database> {
    * `service` role). The endpoint proxies straight to ClickHouse's HTTP
    * interface so any ClickHouse-accepted SQL works; positional `?` param
    * binding is NOT supported — inline literals or use the structured query
-   * builder for safe binding. See sql.ts for details. `opts.tenant` names the
-   * tenant whose ClickHouse the SQL runs against, the default tenant without
-   * it.
+   * builder for safe binding. See sql.ts for details.
    */
   sql<Row = Record<string, unknown>>(
     query: string,

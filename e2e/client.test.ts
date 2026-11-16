@@ -38,20 +38,6 @@ describe("version", () => {
   });
 });
 
-describe("X-Tenant-ID header", () => {
-  const withTenant = (id: string) => newClient({ "X-Tenant-ID": id });
-
-  // "0" is the default tenant, the one every server has.
-  it("serves a data route for the default tenant", async () => {
-    expect((await withTenant("0").sys.health()).error).toBeNull();
-  });
-
-  it("answers an unknown tenant on a data route with 404", async () => {
-    const res = await withTenant("nope").sys.health();
-    expect(res.error?.status).toBe(404);
-  });
-});
-
 describe("schema", () => {
   it("lists the fixture table", async () => {
     const res = await wh.schema.list();

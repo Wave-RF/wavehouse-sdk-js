@@ -159,18 +159,17 @@ describe("SSETransport request construction", () => {
     t.disconnect();
   });
 
-  it("sends a caller's X-Tenant-ID header unchanged", async () => {
+  it("sends a caller's X-Trace-Id header unchanged", async () => {
     const f = makeFetch();
     const t = new SSETransport({
       baseURL: BASE,
       table: "clicks",
-      headers: { "X-Tenant-ID": "acme" },
+      headers: { "X-Trace-Id": "abc" },
       fetch: f.impl,
     });
     t.connect();
     await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
-    expect(headersOf(f.attempts[0])["X-Tenant-ID"]).toBe("acme");
-    expect(new URL(f.attempts[0].url).searchParams.has("tenant")).toBe(false);
+    expect(headersOf(f.attempts[0])["X-Trace-Id"]).toBe("abc");
     t.disconnect();
   });
 
@@ -548,7 +547,7 @@ describe("SSETransport positional rows", () => {
     t2.connect();
     await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    first.push(schemaFrame(["tenant", "tenant"]));
+    first.push(schemaFrame(["dup", "dup"]));
     first.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["a", "b"] }));
     await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
 

@@ -380,7 +380,7 @@ describe("request redirects", () => {
     const res = await request(makeCtx(), {
       method: "GET",
       path: "/x",
-      headers: { "X-Tenant-ID": "acme" },
+      headers: { "X-Trace-Id": "abc" },
     });
     expect(fetchSpy.mock.calls[0][1].redirect).toBe("manual");
     expect(res.error?.code).toBe("REDIRECT");

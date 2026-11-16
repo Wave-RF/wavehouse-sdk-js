@@ -4,7 +4,6 @@ import type {
   FetchLike,
   HeadersProvider,
   HttpContext,
-  OpsRequestOptions,
   WaveHouseError,
 } from "./types.js";
 import { resolveURL } from "./url.js";
@@ -31,7 +30,7 @@ interface RequestSpec {
   /**
    * How safely a call can be sent twice. `read` (the default, and ingest)
    * retries; ingest is at-least-once, and a resent batch is only deduplicated
-   * when the tenant sets the server's `dedupe` setting and the rows carry an id
+   * when the server has its `dedupe` setting on and the rows carry an id
    * field. `sql` and `pipe` may run a write, so they are
    * resent only when the first attempt certainly did nothing — see `mayResend`.
    */
@@ -124,7 +123,7 @@ export async function resolveClientHeaders(
 /**
  * The per-call fields of an options object, for spreading into a `RequestSpec`.
  * Picks fields by name so an options value carrying anything else (`limit`,
- * `tenant`) never leaks into the spec.
+ * say) never leaks into the spec.
  *
  * @internal
  */
@@ -186,18 +185,6 @@ export function attemptGuard(caller: AbortSignal | undefined, ms: number | undef
     ac.abort(new DOMException(`Attempt timed out after ${ms} ms`, "TimeoutError"));
   }, ms);
   return guard;
-}
-
-/**
- * The `?tenant=` query an admin call sends for `opts.tenant`. An empty string
- * is sent, not dropped: the server refuses it, where dropping it would turn a
- * caller's bug into a call that addresses the default tenant — or, on a
- * reload, every tenant.
- *
- * @internal
- */
-export function tenantParam(opts?: OpsRequestOptions): Record<string, string> | undefined {
-  return opts?.tenant === undefined ? undefined : { tenant: opts.tenant };
 }
 
 /** The documented shape for a cancelled request: a Result, never a throw. */

@@ -11,7 +11,7 @@
 - `timeRange` takes a `Date` for `since` and `until`, sent as `toISOString()` (UTC); a string is still sent as given. An invalid `Date` resolves to an `INVALID_QUERY` error before any request.
 - `last(column, duration)` keeps rows from the last `duration` by the server's clock, as `wavehouse-sdk-go`'s `Last` does. `duration` is a number of milliseconds or a `Duration` string (`"90s"`, `"1h"`, `"7d"`; units ms, s, m, h, d, w), sent in the server's relative form. A zero, negative or unparseable duration is an `INVALID_QUERY` error before any request.
 - `wh.version()` returns the server's build (`version`, `git_commit`, `build_time`, `go_version`) from `GET /version`, as `wavehouse-sdk-go`'s `Version` does.
-- Documented: a multi-tenant deployment sets `options.headers: { "X-Tenant-ID": "acme" }`, which reaches every REST call and the stream unchanged. The shared conformance cases gain an optional `"headers"` map for it.
+- The shared conformance cases gain an optional `"headers"` map for the client's `options.headers`.
 
 ### Changed
 
@@ -21,8 +21,11 @@
 - `aggregate()` with an empty alias omits `alias` from the request instead of sending `""`.
 - A `baseURL` carrying a query string or fragment throws at construction, naming the problem; it used to be dropped silently.
 
+- A `baseURL` whose scheme is not `http` or `https` (`ws://`, `ftp://`) throws a `TypeError` at construction, as a stream already refused it at connect; REST calls used to retry it as `NETWORK_ERROR`.
+
 ### Breaking
 
+- Removed the admin calls' `tenant` option and `wavehouse-codegen`'s `--tenant` (`-t`), with `fetchSchemas`' `tenant` option. A caller who needs either passes the header or the query parameter itself, through `options.headers` or its own request.
 - Removed `"not_like"` from `FilterOp`. It type-checked and then failed with a 400 on a query, because the server's filter builder has no such operator. Use a positive `like`, or filter the rows you get back. Fixes #53.
 - Removed `QueryBuilder.cacheTTL()`. It stored a value that was never sent, and the query wire type has no TTL field: the server picks the result-cache TTL itself. Delete the call; behaviour is unchanged. Fixes #45.
 - Removed `wh.pipe(name).stream()` and `wh.dlq.stream()`. The server has no stream for a pipe or for dead letters, so both opened a healthy-looking connection that never delivered an event (`GET /v1/stream` serves ingest tables only). Fixes #54.
@@ -39,7 +42,7 @@
 ### Fixed
 
 - `liveQuery` compares like with like when it deduplicates. A buffered event whose own row carries a non-null `received_timestamp` is compared to the fetched rows by that column; the frame's timestamp (when WaveHouse received the event, earlier than a `DEFAULT now64()` insert time) is used only when the row has no such column. Deduplication stays best-effort until the server gives a read watermark (Wave-RF/WaveHouse#951), and `liveQuery` says so. The unused filters argument of `LiveQuery` is gone.
-- `liveQuery`'s backfill request now carries the subscription's `StreamOptions`: `headers` (an `X-Tenant-ID` reached the stream but not `/v1/query`), `attemptTimeoutMs` and `signal`. An aborted `signal` ends the live query like `close()`, so `initial()` and `next()` are never called after it, including by a backfill still in flight.
+- `liveQuery`'s backfill request now carries the subscription's `StreamOptions`: `headers` (a custom header reached the stream but not `/v1/query`), `attemptTimeoutMs` and `signal`. An aborted `signal` ends the live query like `close()`, so `initial()` and `next()` are never called after it, including by a backfill still in flight.
 - A `baseURL` that names no host throws a `TypeError` at construction. A bare path such as `/api/warehouse` used to normalise to `https:///api/warehouse`, which reads as the host `api`, so every call went to the wrong server. `/`, `//`, `https:///x` and an empty base are refused the same way.
 - `options.maxRetries` is validated at construction: a negative, fractional or non-finite value throws a `TypeError` naming it. A negative count used to make a call return neither data nor an error, so `.fetch()` threw a `TypeError` on `null`. `wavehouse-sdk-go` rejects the same values in `New`.
 - A `200` whose body is not JSON (an intermediary's HTML page, say) returns a non-retryable `DECODE_ERROR` carrying the status, and the request is sent once. It used to be classed as a `NETWORK_ERROR` and retried, a write included. `wavehouse-sdk-go` already behaved this way.
@@ -52,13 +55,13 @@
 - `selectAll()` combined with `select()` columns or an aggregation, in either order, now resolves to an `INVALID_QUERY` error without sending a request, instead of reaching the server and failing with a 400. Fixes #31.
 - `wavehouse-codegen` quotes table and column names that are not identifiers (`user-id`, `2fa`, `order id`), and gives tables whose names differ only in case, or that start with a digit, distinct valid interface names. Fixes #37.
 - `wh.sql()` and pipe calls are no longer sent twice. A raw SQL statement is resent only when the connection was never made; a pipe call also when the server answers `retryable: true`, with a 429, or with a 503 and `Retry-After`. A bare 5xx or a dropped connection, which may follow a write that ran, is returned as the error. Fixes #56.
-- `wavehouse-codegen` refuses an argument it does not recognise (a mistyped `--tenant`, a bare positional, `--flag=value`) instead of skipping it, which read as tenant `0` with exit 0. Fixes #44.
+- `wavehouse-codegen` refuses an argument it does not recognise (a mistyped flag, a bare positional, `--flag=value`) instead of skipping it, which read as an absent flag with exit 0. Fixes #44.
 - A stream that connects without `since` and drops before its first event now resumes from that connection's start, so rows ingested during the reconnect backoff are delivered. Fixes #57.
 - A stream with a callback subscriber no longer queues every event for an async iterator nobody started, so a long-lived `subscribe()` or `liveQuery()` stops growing in memory. Events that arrive before the first subscriber are dropped once one registers and no iterator exists. Fixes #21.
 - A subscriber that throws no longer stops delivery to the others. Each `next`, `status` and `error` callback is isolated and its throw is logged, so a `for await` still receives the event and still ends on `closed`; a throwing `status` handler no longer escapes `.subscribe()` or `.liveQuery()`; and a throwing `initial()` or `next()` during the live-query backfill no longer discards the remaining buffered events, which are also delivered when the backfill fetch fails. Fixes #28.
 - A subscriber that registers after a stream ended on a terminal error now receives that error, so it learns why the stream closed rather than only that it did. Fixes #36.
 - A retried request no longer leaves an abort listener on the caller's `AbortSignal` each time its backoff timer wins, which tripped Node's `MaxListenersExceededWarning` on a signal shared across many requests. Fixes #29.
-- A stream that takes a `429 Too Many Requests` now re-dials instead of staying dead until a reload (unless the body says `retryable: false`); every other 4xx still ends it. A `Retry-After` on a retryable stream response, in seconds or as an HTTP-date, sets the floor for that wait, clamped to 30 s. Fixes #25 and the stream half of #43.
+- A stream that takes a `429 Too Many Requests` now re-dials instead of staying dead until a reload (unless the body says `retryable: false`); a 408 re-dials too, and every other 4xx still ends it. A `Retry-After` on a retryable stream response, in seconds or as an HTTP-date, sets the floor for that wait, clamped to 30 s. Fixes #25 and the stream half of #43.
 - In a browser, a stream configured with `fetchOptions: { credentials: "include" }` now refuses redirects (`SSE_REDIRECT`) like one carrying a token or `headers`, instead of following one that drops its cookie and downgrades it to the default role. Cookies relied on through the implicit `same-origin` default remain invisible to the check, as documented on `fetchOptions`. Fixes #30.
 - `liveQuery` deduplicates against the newest `received_timestamp` among the fetched rows, compared as parsed instants, instead of the last row compared as text. A descending order no longer redelivers rows already in `initial()`, and a second-precision boundary no longer drops same-second events that are newer. Buffered events are no longer dropped when the fetch fails (see #28). A table with no `received_timestamp` column, or a `.select()` that drops it, still has nothing to deduplicate against, so events that arrived during the fetch may repeat rows in `initial()`. Fixes #52 on the SDK side.
 - A stream whose connection ends in a buffer overflow no longer resets the reconnect backoff just because it ran past the stable window, so a peer that overflows every time is re-dialed on a growing schedule rather than at a flat rate. A `fetch` that ignores `init.signal` can no longer open a stream after `close()`, and `FetchLike`'s documentation now says the signal must be honored. Fixes #32.

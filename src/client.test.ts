@@ -66,6 +66,20 @@ describe("createClient", () => {
     },
   );
 
+  it.each(["ws://localhost:8080", "wss://example.com/api", "ftp://example.com"])(
+    "rejects the non-http baseURL %j at construction",
+    (baseURL) => {
+      expect(() => createClient({ baseURL })).toThrow(/must use http or https/);
+    },
+  );
+
+  it.each(["http://localhost:8080", "HTTPS://example.com/api", "localhost:8080"])(
+    "accepts the baseURL %j",
+    (baseURL) => {
+      expect(() => createClient({ baseURL })).not.toThrow();
+    },
+  );
+
   it("accepts maxRetries 0", () => {
     const client = createClient({ baseURL: "http://localhost:8080", options: { maxRetries: 0 } });
     expect(client._ctx.options.maxRetries).toBe(0);
@@ -264,7 +278,7 @@ describe("options.headers", () => {
   it("adds configured headers to every request", async () => {
     const client = createClient({
       baseURL: "http://localhost:8080",
-      options: { headers: { "CF-Access-Client-Id": "abc.access", "X-Tenant": "acme" } },
+      options: { headers: { "CF-Access-Client-Id": "abc.access", "X-Trace": "abc" } },
     });
 
     await client.from("clicks").select("*").limit(1);
@@ -275,7 +289,7 @@ describe("options.headers", () => {
     for (const call of [0, 1]) {
       expect(headersOf(call)).toMatchObject({
         "CF-Access-Client-Id": "abc.access",
-        "X-Tenant": "acme",
+        "X-Trace": "abc",
       });
     }
   });
@@ -311,29 +325,29 @@ describe("options.headers", () => {
 
   it("collapses two configured spellings of one header instead of sending both", async () => {
     // Left as separate keys, the Headers constructor comma-joins them at fetch
-    // time — `x-tenant: acme, beta` — which is the corruption this guards.
+    // time — `x-trace: abc, beta` — which is the corruption this guards.
     const client = createClient({
       baseURL: "http://localhost:8080",
-      options: { headers: { "x-tenant": "acme", "X-Tenant": "beta" } },
+      options: { headers: { "x-trace": "abc", "X-Trace": "beta" } },
     });
 
     await client.from("clicks").select("*").limit(1);
 
     const sent = headersOf(0);
-    const spellings = Object.keys(sent).filter((k) => k.toLowerCase() === "x-tenant");
+    const spellings = Object.keys(sent).filter((k) => k.toLowerCase() === "x-trace");
     expect(spellings).toHaveLength(1);
-    expect(new Headers(sent).get("x-tenant")).toBe("beta");
+    expect(new Headers(sent).get("x-trace")).toBe("beta");
   });
 
   it("still applies when no auth is configured", async () => {
     const client = createClient({
       baseURL: "http://localhost:8080",
-      options: { headers: { "X-Tenant": "acme" } },
+      options: { headers: { "X-Trace": "abc" } },
     });
 
     await client.from("clicks").select("*").limit(1);
 
-    expect(headersOf(0)["X-Tenant"]).toBe("acme");
+    expect(headersOf(0)["X-Trace"]).toBe("abc");
     expect(headersOf(0).Authorization).toBeUndefined();
   });
 });
@@ -357,11 +371,11 @@ describe("options.fetchOptions", () => {
       baseURL: "http://localhost:8080",
       auth: () => "test-token",
       options: {
-        headers: { "X-Tenant": "acme" },
+        headers: { "X-Trace": "abc" },
         fetchOptions: {
           method: "DELETE",
           body: "hijacked",
-          headers: { "X-Tenant": "overridden", Authorization: "Bearer impostor" },
+          headers: { "X-Trace": "overridden", Authorization: "Bearer impostor" },
         } as RequestInit,
       },
     });
@@ -374,7 +388,7 @@ describe("options.fetchOptions", () => {
     // options.headers is the header channel; fetchOptions.headers is discarded
     // wholesale rather than merged, so it can't smuggle an Authorization past auth.
     expect(init.headers).toMatchObject({
-      "X-Tenant": "acme",
+      "X-Trace": "abc",
       Authorization: "Bearer test-token",
     });
   });
@@ -404,9 +418,8 @@ describe("stream error delivery", () => {
   });
 });
 
-describe("X-Tenant-ID through options.headers", () => {
-  // The SDK has no tenant option: selecting one is the caller's header, sent
-  // unchanged on every call. Per-call `opts.tenant` on admin routes is separate.
+describe("X-Trace-Id through options.headers", () => {
+  // A caller's own header is sent unchanged on every call.
   const calls: { url: URL; headers: Record<string, string> }[] = [];
   const fetchStub: FetchLike = async (url, init) => {
     calls.push({ url: new URL(url), headers: (init?.headers ?? {}) as Record<string, string> });
@@ -419,15 +432,14 @@ describe("X-Tenant-ID through options.headers", () => {
   it("reaches data and admin routes unchanged", async () => {
     const wh = createClient({
       baseURL: "http://wavehouse.test",
-      options: { fetch: fetchStub, maxRetries: 0, headers: { "X-Tenant-ID": "acme" } },
+      options: { fetch: fetchStub, maxRetries: 0, headers: { "X-Trace-Id": "abc" } },
     });
     await wh.sys.health();
     await wh.pipes.list();
     await wh.from("clicks").select("*").limit(1);
     expect(calls).toHaveLength(3);
     for (const c of calls) {
-      expect(c.headers["X-Tenant-ID"]).toBe("acme");
-      expect(c.url.searchParams.has("tenant")).toBe(false);
+      expect(c.headers["X-Trace-Id"]).toBe("abc");
     }
   });
 
@@ -437,7 +449,7 @@ describe("X-Tenant-ID through options.headers", () => {
       options: { fetch: fetchStub, maxRetries: 0 },
     });
     await wh.sys.health();
-    expect(calls[0].headers["X-Tenant-ID"]).toBeUndefined();
+    expect(calls[0].headers["X-Trace-Id"]).toBeUndefined();
   });
 });
 

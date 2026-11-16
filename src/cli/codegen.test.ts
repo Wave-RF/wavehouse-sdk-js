@@ -49,17 +49,7 @@ describe("fetchSchemas", () => {
     expect(schemas).toEqual(wireSchemas);
     const [url] = fetchSpy.mock.calls[0];
     expect(String(url)).toContain("/v1/ops/schema");
-    // No --tenant: the request names no tenant, so the server reads tenant 0.
-    expect(new URL(String(url)).searchParams.has("tenant")).toBe(false);
-  });
-
-  it("names the tenant in the query string when asked", async () => {
-    fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
-
-    await fetchSchemas("http://localhost:8080", { tenant: "acme" });
-
-    const [url] = fetchSpy.mock.calls[0];
-    expect(new URL(String(url)).searchParams.get("tenant")).toBe("acme");
+    expect(new URL(String(url)).search).toBe("");
   });
 
   it("sends the bearer token", async () => {
@@ -79,7 +69,7 @@ describe("fetchSchemas", () => {
 
     const [, init] = fetchSpy.mock.calls[0];
     // Two credentials, two headers: the operator key is not a bearer token and
-    // must not overwrite one (--tenant with --auth is a valid flat-directory call).
+    // must not overwrite one.
     expect(init.headers["X-Operator-Key"]).toBe("op-key");
     expect(init.headers.Authorization).toBe("Bearer tok");
   });
@@ -97,7 +87,7 @@ describe("fetchSchemas", () => {
   it("follows redirects while the request carries no credential", async () => {
     fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
 
-    await fetchSchemas("http://localhost:8080", { tenant: "acme" });
+    await fetchSchemas("http://localhost:8080");
 
     const [, init] = fetchSpy.mock.calls[0];
     expect(init.redirect).toBe("follow");
@@ -155,27 +145,20 @@ describe("parseArgs", () => {
     expect(parseArgs(argv())).toEqual({ url: "http://localhost:8080", out: "./wavehouse.d.ts" });
   });
 
-  it.each([
-    ["--tenant", "-t"],
-    ["--operator-key", "-k"],
-  ])("accepts %s and its alias %s", (long, short) => {
-    const key = long === "--tenant" ? "tenant" : "operatorKey";
-    expect(parseArgs(argv(long, "v"))[key]).toBe("v");
-    expect(parseArgs(argv(short, "v"))[key]).toBe("v");
+  it("accepts --operator-key and its alias -k", () => {
+    expect(parseArgs(argv("--operator-key", "v")).operatorKey).toBe("v");
+    expect(parseArgs(argv("-k", "v")).operatorKey).toBe("v");
   });
 
   it("reads every flag together, each independent of the others", () => {
     expect(
-      parseArgs(
-        argv("-u", "http://wh:8080", "-o", "./db.d.ts", "-a", "tok", "-k", "op-key", "-t", "acme"),
-      ),
+      parseArgs(argv("-u", "http://wh:8080", "-o", "./db.d.ts", "-a", "tok", "-k", "op-key")),
     ).toEqual({
       url: "http://wh:8080",
       out: "./db.d.ts",
       auth: "tok",
       authFromArgv: true,
       operatorKey: "op-key",
-      tenant: "acme",
     });
   });
 
@@ -184,14 +167,13 @@ describe("parseArgs", () => {
     ["--url", "-u"],
     ["--out", "-o"],
     ["--auth", "-a"],
-    ["--tenant", "-t"],
     ["--operator-key", "-k"],
   ];
   const everyFlag = [...valueFlags.flat(), "--auth-stdin", "--help", "-h"];
 
   // An unset shell variable is how a flag loses its value: quoted it leaves
   // "", unquoted it lets the flag after it slide into the value's place
-  // (`--operator-key --tenant acme` would send "--tenant" as the key).
+  // (`--operator-key --auth tok` would send "--auth" as the key).
   it.each(valueFlags)(
     "refuses %s (%s) with no value, an empty one, or a flag in its place",
     (long, short) => {
@@ -207,12 +189,8 @@ describe("parseArgs", () => {
   );
 
   it("takes a value that starts with a dash, since only a flag is refused", () => {
-    // Both are legal: the tenant grammar allows "-" anywhere, and a base64url
-    // operator key starts with one once in 64.
-    expect(parseArgs(argv("-t", "-acme", "-k", "-x9_Tq"))).toMatchObject({
-      tenant: "-acme",
-      operatorKey: "-x9_Tq",
-    });
+    // Legal: a base64url operator key starts with one once in 64.
+    expect(parseArgs(argv("-k", "-x9_Tq"))).toMatchObject({ operatorKey: "-x9_Tq" });
   });
 });
 
@@ -284,14 +262,14 @@ describe("resolveCredentials", () => {
 describe("parseArgs unknown arguments", () => {
   const argv = (...flags: string[]) => ["node", "codegen.ts", ...flags];
 
-  // Each of these used to parse cleanly and fall back to tenant 0 or no key.
+  // Each of these used to parse cleanly and be skipped, leaving no key.
   it.each([
-    [["--tenat", "acme"]],
-    [["--tenant-id", "acme"]],
-    [["-T", "acme"]],
-    [["--tenant=acme"]],
-    [["acme"]],
-    [["--operator-ket", "k", "--tenant", "acme"]],
+    [["--operator-ket", "k"]],
+    [["--operator-key-id", "k"]],
+    [["-K", "k"]],
+    [["--operator-key=k"]],
+    [["k"]],
+    [["--operator-ket", "k", "--auth", "tok"]],
   ])("refuses %j rather than skipping it", (flags) => {
     expect(() => parseArgs(argv(...flags))).toThrow(/unknown argument/);
   });

@@ -25,7 +25,6 @@ interface CliArgs {
   authFromArgv?: boolean;
   /** Read the token from stdin (`--auth-stdin`). */
   authStdin?: boolean;
-  tenant?: string;
   operatorKey?: string;
 }
 
@@ -37,8 +36,6 @@ const FLAGS = new Set([
   "-o",
   "--auth",
   "-a",
-  "--tenant",
-  "-t",
   "--auth-stdin",
   "--operator-key",
   "-k",
@@ -49,8 +46,8 @@ const FLAGS = new Set([
 // A flag's value: the next argument, which has to be there, non-empty, and not
 // another flag. An unset shell variable is how it comes to be otherwise:
 // quoted it leaves "", unquoted it lets the flag after it slide into its
-// place, to be sent as the tenant or the credential. Only a flag is refused,
-// not every leading dash: a tenant id or an operator key may start with one.
+// place, to be sent as the credential. Only a flag is refused, not every
+// leading dash: an operator key may start with one.
 function operand(value: string | undefined, usage: string): string {
   if (!value || FLAGS.has(value)) throw new Error(usage);
   return value;
@@ -76,13 +73,6 @@ function parseArgs(argv: string[]): CliArgs {
       case "--auth-stdin":
         args.authStdin = true;
         break;
-      case "--tenant":
-      case "-t":
-        // The id itself goes unchecked: its grammar is the server's, which
-        // answers a bad one with 400, an empty ?tenant= included, so an
-        // empty value could never have meant "tenant 0".
-        args.tenant = operand(argv[++i], "--tenant needs a tenant id");
-        break;
       case "--operator-key":
       case "-k":
         args.operatorKey = operand(argv[++i], "--operator-key needs a key");
@@ -99,17 +89,13 @@ Options:
                       shell history
   --auth, -a          Bearer token as an argument. Deprecated: the process
                       table and shell history record it
-  --operator-key, -k  Operator key, sent as X-Operator-Key (the credential a
-                      nested settings directory's /v1/ops/* routes admit);
+  --operator-key, -k  Operator key, sent as X-Operator-Key;
                       WAVEHOUSE_OPERATOR_KEY sets it without an argument
-  --tenant, -t        Tenant whose schema to read, sent as ?tenant=
-                      (default: tenant 0)
   --help, -h          Show this help`);
         process.exit(0);
         break;
       default:
-        // A mistyped --tenant must not read as an absent one: that falls back
-        // to tenant 0 and writes the wrong tenant's types with exit 0.
+        // A mistyped flag must not be skipped: it would read as an absent one.
         throw new Error(`unknown argument ${JSON.stringify(argv[i])}; see --help`);
     }
   }
@@ -257,8 +243,6 @@ interface FetchOptions {
   auth?: string;
   /** Operator key, sent as `X-Operator-Key`; independent of `auth`. */
   operatorKey?: string;
-  /** Tenant to read, sent as `?tenant=`; absent reads tenant 0. */
-  tenant?: string;
 }
 
 async function fetchSchemas(url: string, opts: FetchOptions = {}): Promise<TableSchema[]> {
@@ -266,11 +250,7 @@ async function fetchSchemas(url: string, opts: FetchOptions = {}): Promise<Table
   if (opts.auth) headers.Authorization = `Bearer ${opts.auth}`;
   if (opts.operatorKey) headers["X-Operator-Key"] = opts.operatorKey;
 
-  const target = resolveURL(
-    url,
-    "/v1/ops/schema",
-    opts.tenant ? { tenant: opts.tenant } : undefined,
-  );
+  const target = resolveURL(url, "/v1/ops/schema");
   // A redirect is followed only when the request carries no credential, the
   // streaming transport's rule (stream/sse.ts `_init`): fetch drops
   // Authorization on a cross-origin hop and re-sends every other header, so
@@ -421,7 +401,7 @@ async function main() {
 
   console.log(`Fetching schema from ${args.url}...`);
   const creds = await resolveCredentials(args, process.env, readStdin, console.warn);
-  const schemas = await fetchSchemas(args.url, { ...creds, tenant: args.tenant });
+  const schemas = await fetchSchemas(args.url, creds);
 
   if (schemas.length === 0) {
     console.warn("No tables found. Is WaveHouse running with tables in ClickHouse?");

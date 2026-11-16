@@ -26,11 +26,6 @@ describe("sql", () => {
     const result = await sql(makeCtx(), "SELECT count() FROM clicks");
     expect(new URL(fetchSpy.mock.calls[0][0]).search).toBe("");
 
-    await sql(makeCtx(), "SELECT 1", { tenant: "acme" });
-    expect(
-      new URL(fetchSpy.mock.calls[1][0]).pathname + new URL(fetchSpy.mock.calls[1][0]).search,
-    ).toBe("/v1/ops/query?tenant=acme");
-
     expect(result.data).toEqual([{ count: 10 }]);
     const [url, init] = fetchSpy.mock.calls[0];
     expect(url).toContain("/v1/ops/query");
@@ -85,24 +80,6 @@ describe("SchemaNamespace", () => {
     expect(fetchSpy.mock.calls[0][0]).toContain("/v1/ops/schema");
   });
 
-  it("list() and refresh() send opts.tenant as ?tenant=, and nothing without it", async () => {
-    fetchSpy.mockImplementation(async () => new Response("[]", { status: 200 }));
-    const ns = new SchemaNamespace(makeCtx());
-
-    await ns.list({ tenant: "acme" });
-    await ns.refresh({ tenant: "acme" });
-    await ns.list();
-    // An empty id is the caller's bug: it is sent for the server to refuse,
-    // never dropped into a read of the default tenant.
-    await ns.refresh({ tenant: "" });
-
-    const urls = fetchSpy.mock.calls.map((call) => new URL(call[0]));
-    expect(urls[0].pathname + urls[0].search).toBe("/v1/ops/schema?tenant=acme");
-    expect(urls[1].pathname + urls[1].search).toBe("/v1/ops/schema/refresh?tenant=acme");
-    expect(urls[2].search).toBe("");
-    expect(urls[3].search).toBe("?tenant=");
-  });
-
   it("refresh() POSTs to /v1/ops/schema/refresh", async () => {
     fetchSpy.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
 
@@ -142,25 +119,6 @@ describe("DLQNamespace", () => {
     await ns.table("clicks");
 
     expect(fetchSpy.mock.calls[0][0]).toContain("table=clicks");
-  });
-
-  it("list() and table() send opts.tenant as ?tenant=, and nothing without it", async () => {
-    fetchSpy.mockImplementation(
-      async () => new Response(JSON.stringify({ tables: {}, total: 0 }), { status: 200 }),
-    );
-    const ns = new DLQNamespace(makeCtx());
-
-    await ns.list({ tenant: "acme" });
-    await ns.table("clicks", { tenant: "acme" });
-    await ns.list();
-    await ns.table("clicks");
-
-    const urls = fetchSpy.mock.calls.map((call) => new URL(call[0]));
-    expect(urls[0].pathname + urls[0].search).toBe("/v1/ops/dlq/stats?tenant=acme");
-    expect(urls[1].searchParams.get("table")).toBe("clicks");
-    expect(urls[1].searchParams.get("tenant")).toBe("acme");
-    expect(urls[2].search).toBe("");
-    expect(urls[3].search).toBe("?table=clicks");
   });
 
   it("has no stream() — the server has no dead-letter stream", () => {
@@ -206,19 +164,6 @@ describe("SettingsNamespace", () => {
     expect(result.data).toEqual(body);
     expect(fetchSpy.mock.calls[0][1].method).toBe("POST");
     expect(fetchSpy.mock.calls[0][0]).toContain("/v1/ops/settings/reload");
-  });
-
-  it("reload() sends opts.tenant as ?tenant=, and nothing without it", async () => {
-    const body = { adopted: true, findings: [] };
-    fetchSpy.mockImplementation(async () => new Response(JSON.stringify(body), { status: 200 }));
-    const ns = new SettingsNamespace(makeCtx());
-
-    await ns.reload({ tenant: "acme" });
-    await ns.reload();
-
-    const urls = fetchSpy.mock.calls.map((call) => new URL(call[0]));
-    expect(urls[0].pathname + urls[0].search).toBe("/v1/ops/settings/reload?tenant=acme");
-    expect(urls[1].search).toBe("");
   });
 
   it("reload() surfaces a 422 rejection as an error", async () => {

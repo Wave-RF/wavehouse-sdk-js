@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { callOpts, request, tenantParam } from "./http.js";
+import { callOpts, request } from "./http.js";
 import type { DLQStats, HttpContext, OpsRequestOptions, Result } from "./types.js";
 
 /** Namespace for Dead Letter Queue operations. */
@@ -10,27 +10,23 @@ export class DLQNamespace {
     this._ctx = ctx;
   }
 
-  /**
-   * Get DLQ statistics (message counts per table) — of `opts.tenant`, the
-   * default tenant without it. A tenant with no dead-letter queue is a `404`.
-   */
+  /** Get DLQ statistics (message counts per table). */
   async list(opts?: OpsRequestOptions): Promise<Result<DLQStats>> {
     const { data, error } = await request<DLQStats>(this._ctx, {
       method: "GET",
       path: "/v1/ops/dlq/stats",
-      params: tenantParam(opts),
       ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
   }
 
-  /** Get DLQ stats filtered by table name — of `opts.tenant`, the default tenant without it. */
+  /** Get DLQ stats filtered by table name. */
   async table(name: string, opts?: OpsRequestOptions): Promise<Result<DLQStats>> {
     const { data, error } = await request<DLQStats>(this._ctx, {
       method: "GET",
       path: "/v1/ops/dlq/stats",
-      params: { table: name, ...tenantParam(opts) },
+      params: { table: name },
       ...callOpts(opts),
     });
     if (error) return err(error);

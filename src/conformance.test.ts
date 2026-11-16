@@ -16,7 +16,6 @@ interface WireCase {
   sdks?: string[];
   endpoint: string;
   table?: string;
-  tenant?: string;
   /** Request headers set through `options.headers`. */
   headers?: Record<string, string>;
   /** The call's own headers, through the per-call `headers` option. */
@@ -76,8 +75,6 @@ async function run(tc: WireCase): Promise<Seen[]> {
     options: { fetch, maxRetries: 0, headers: tc.headers },
   });
   const ops = tc.operations ?? [];
-  // A per-call tenant is the admin routes' `?tenant=`.
-  const opts = tc.tenant === undefined ? undefined : { tenant: tc.tenant };
   const call = tc.call_headers === undefined ? undefined : { headers: tc.call_headers };
 
   switch (tc.endpoint) {
@@ -93,7 +90,7 @@ async function run(tc: WireCase): Promise<Seen[]> {
     // JS has one raw-SQL call; Go splits it into Fetch and Exec.
     case "sql":
     case "sql_exec":
-      await wh.sql(tc.sql ?? "", { ...opts, ...call });
+      await wh.sql(tc.sql ?? "", call);
       break;
     case "health":
       await wh.sys.health();
@@ -102,25 +99,25 @@ async function run(tc: WireCase): Promise<Seen[]> {
       await wh.version();
       break;
     case "schema_list":
-      await wh.schema.list(opts);
+      await wh.schema.list();
       break;
     case "schema_table":
-      await wh.from(tc.table ?? "").schema(opts);
+      await wh.from(tc.table ?? "").schema();
       break;
     case "schema_refresh":
-      await wh.schema.refresh(opts);
+      await wh.schema.refresh();
       break;
     case "dlq_list":
-      await wh.dlq.list(opts);
+      await wh.dlq.list();
       break;
     case "settings_reload":
-      await wh.settings.reload(opts);
+      await wh.settings.reload();
       break;
     case "pipes_list":
-      await wh.pipes.list(opts);
+      await wh.pipes.list();
       break;
     case "pipes_get":
-      await wh.pipes.get(tc.pipe_name ?? "", opts);
+      await wh.pipes.get(tc.pipe_name ?? "");
       break;
     default:
       // A hard failure, so a case nobody wired up can't hide drift between the SDKs.

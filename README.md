@@ -30,7 +30,7 @@ No bundler, no `npm`, no framework required — drop the SDK straight into an HT
 </script>
 ```
 
-Pin a version for production (`https://esm.sh/@wavehouse/sdk@0.2.0`). jsDelivr (`https://cdn.jsdelivr.net/npm/@wavehouse/sdk/+esm`) and unpkg (`https://unpkg.com/@wavehouse/sdk?module`) serve the same ES module.
+Pin a version for production (`https://esm.sh/@wavehouse/sdk@0.3.0`). jsDelivr (`https://cdn.jsdelivr.net/npm/@wavehouse/sdk/+esm`) and unpkg (`https://unpkg.com/@wavehouse/sdk?module`) serve the same ES module.
 
 **Classic global (`<script src>`).** For pages that can't use ES modules, the bundled IIFE build attaches everything to a `WaveHouse` global:
 
@@ -42,7 +42,7 @@ Pin a version for production (`https://esm.sh/@wavehouse/sdk@0.2.0`). jsDelivr (
 </script>
 ```
 
-**Versioning.** A bare CDN URL serves the latest published **release**; pin for production (`@wavehouse/sdk@0.2.0`) or float on a range (`@0` for the newest 0.x, `@0.2` for 0.2.x). Builds from `main` are published under the `dev` tag — `@wavehouse/sdk@dev` — for trying unreleased changes.
+**Versioning.** A bare CDN URL serves the latest published **release**; pin for production (`@wavehouse/sdk@0.3.0`) or float on a range (`@0` for the newest 0.x, `@0.3` for 0.3.x). Builds from `main` are published under the `dev` tag — `@wavehouse/sdk@dev` — for trying unreleased changes.
 
 Streaming (`.stream()`) runs on `fetch`, so it works in both forms with no polyfill.
 
@@ -118,17 +118,11 @@ while (result.hasMore && result.next) {
 }
 ```
 
-### Tenants and server version
+### Server version
 
 ```ts
-// A multi-tenant server: the SDK has no tenant option. Send X-Tenant-ID
-// yourself through the custom-header hook; it reaches every call and the stream.
-const acme = createClient({ baseURL: '...', options: { headers: { 'X-Tenant-ID': 'acme' } } });
-
-const { data: build } = await acme.version(); // GET /version: { version, git_commit, build_time, go_version }
+const { data: build } = await wh.version(); // GET /version: { version, git_commit, build_time, go_version }
 ```
-
-Admin calls (`/v1/ops/*`) ignore the header and take a per-call `opts.tenant`, sent as `?tenant=`.
 
 ### Authentication, headers and timeouts
 
@@ -193,7 +187,7 @@ Generate TypeScript types from your live WaveHouse schema. The package ships a `
 npx wavehouse-codegen --url http://localhost:8080 --out ./src/db.d.ts
 ```
 
-This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, and outputs a `Database` interface you can pass to `createClient<Database>()`. `/v1/ops/schema` is **admin-only** — pass an admin-role token against any non-dev policy, in the `WAVEHOUSE_ADMIN_TOKEN` environment variable or on stdin with `--auth-stdin`. `--auth <jwt>` (or `-a`) still works but is deprecated, because an argument shows in the process list and shell history. Over a nested settings directory the route admits the operator key alone: pass it with `--operator-key <key>` (or `-k`, or `WAVEHOUSE_OPERATOR_KEY`) and name the tenant with `--tenant <id>` (or `-t`); without `--tenant` it reads tenant `0`'s schema.
+This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, and outputs a `Database` interface you can pass to `createClient<Database>()`. `/v1/ops/schema` is **admin-only** — pass an admin-role token against any non-dev policy, in the `WAVEHOUSE_ADMIN_TOKEN` environment variable or on stdin with `--auth-stdin`. `--auth <jwt>` (or `-a`) still works but is deprecated, because an argument shows in the process list and shell history. A server that takes the operator key instead of a JWT reads it from `--operator-key <key>` (or `-k`, or `WAVEHOUSE_OPERATOR_KEY`).
 
 ## Development & Testing
 

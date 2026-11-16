@@ -36,6 +36,12 @@ export interface WaveHouseError {
   code: string;
   message: string;
   details?: unknown;
+  /**
+   * On an API answer, the server's own verdict that it is transient, which
+   * `wh.sql()` and pipe calls may carry without the SDK resending them. On a
+   * transport error it is whether this call may be sent again: cleared for a
+   * `wh.sql()` or pipe call whose request may have reached the server.
+   */
   retryable: boolean;
 }
 
@@ -233,11 +239,6 @@ export interface ClientOptions {
    * attempt and every stream connect, under the same contract as `auth` — it
    * must be cheap, and caching is yours to do. A rejection throws out of a REST
    * call, and is a retryable `SSE_AUTH_ERROR` on a stream.
-   *
-   * This is also how a multi-tenant deployment selects its tenant: the SDK has
-   * no tenant option, so pass `{ "X-Tenant-ID": "acme" }`, sent unchanged on
-   * every REST call and on the stream. (The admin routes ignore it; they take
-   * a per-call `opts.tenant` as `?tenant=`.)
    *
    * In a browser these are subject to CORS: a header outside the safelist adds
    * it to the preflight, which the origin must allow. WaveHouse's own CORS
@@ -494,8 +495,6 @@ export interface SettingsFinding {
   severity: "error" | "warning";
   /**
    * Settings file the finding is about; absent for directory-level findings.
-   * In a directory of tenant folders it leads with the folder
-   * (`acme/policies.json`).
    */
   file?: string;
   /** Dotted JSON path within the file; absent for whole-file findings. */
@@ -507,10 +506,7 @@ export interface SettingsFinding {
 export interface SettingsReloadResult {
   /**
    * Whether everything the reload covered was adopted; false leaves the
-   * previous settings in effect. Over a directory of tenant folders false can
-   * mean adopted in part: the tenants with an error among their `findings`
-   * were not adopted and are no longer served, and the rest were — `findings`
-   * carries every folder's warnings too.
+   * previous settings in effect.
    */
   adopted: boolean;
   /** Every finding from the validation pass (warnings included on success). */
@@ -579,22 +575,12 @@ export interface PipeRequestOptions extends CallOptions {
 }
 
 /**
- * Options for a call to one of the admin routes that address a tenant:
- * `wh.pipes.list()`, `wh.pipes.get()`, `wh.settings.reload()`,
- * `wh.schema.list()`, `wh.schema.refresh()`, `wh.from(t).schema()`,
- * `wh.dlq.list()`, `wh.dlq.table()` and `wh.sql()`.
+ * Options for a call to one of the admin routes: `wh.pipes.list()`,
+ * `wh.pipes.get()`, `wh.settings.reload()`, `wh.schema.list()`,
+ * `wh.schema.refresh()`, `wh.from(t).schema()`, `wh.dlq.list()`,
+ * `wh.dlq.table()` and `wh.sql()`.
  */
-export interface OpsRequestOptions extends CallOptions {
-  /**
-   * The tenant the call addresses, sent as `?tenant=`. The admin routes ignore
-   * the `X-Tenant-ID` header, so `options.headers` cannot select one. Omitted,
-   * the reads, the refresh and `sql()` serve the default tenant (`0`) and
-   * `reload()` reloads every tenant. An id the server does not accept — the
-   * empty string included — is a `400`, never a silent fallback to the
-   * default.
-   */
-  tenant?: string;
-}
+export type OpsRequestOptions = CallOptions;
 
 /** The server's build, from `GET /version`. */
 export interface VersionInfo {

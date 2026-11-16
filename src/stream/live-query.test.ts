@@ -350,10 +350,10 @@ describe("liveQuery through the client", () => {
     const lq = wh
       .from("clicks")
       .selectAll()
-      .liveQuery({ next: () => {} }, { headers: { "X-Tenant-ID": "acme" } });
+      .liveQuery({ next: () => {} }, { headers: { "X-Trace-Id": "abc" } });
     await vi.waitFor(() => expect(f.calls).toHaveLength(2));
     for (const c of f.calls) {
-      expect((c.init.headers as Record<string, string>)["X-Tenant-ID"]).toBe("acme");
+      expect((c.init.headers as Record<string, string>)["X-Trace-Id"]).toBe("abc");
     }
     lq.close();
     f.release();

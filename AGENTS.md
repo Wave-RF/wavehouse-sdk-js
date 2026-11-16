@@ -28,7 +28,7 @@ The live tests are in `e2e/`, with their own `vitest.e2e.config.ts`, and need Do
 
 ## Releases
 
-A release is a tag `vX.Y.Z` on `main`; the tag is the version, and `.github/workflows/publish-npm.yml` stamps it into `package.json` at publish time, so don't bump `version` in a PR. Pushes to `main` also publish a `dev` snapshot. Publishing is gated on the repository variable `NPM_PUBLISH_ENABLED` and stays off until npm's trusted publisher is moved here from the server repository; the cutover steps are in the workflow's header.
+A release is a tag `vX.Y.Z` on `main`; the tag is the version, and `.github/workflows/publish-npm.yml` stamps it into `package.json` at publish time, so don't bump `version` in a PR. Pushes to `main` also publish a `dev` snapshot. npm's trusted publisher for the package is this repository's workflow, and publishing is gated on the repository variable `NPM_PUBLISH_ENABLED`.
 
 ## Documentation
 

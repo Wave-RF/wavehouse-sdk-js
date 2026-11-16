@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { callOpts, request, tenantParam } from "./http.js";
+import { callOpts, request } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Pipe, PipeRequestOptions, Result } from "./types.js";
 
 /** Reference to a named query pipe — PromiseLike for convenient `await`. */
@@ -58,24 +58,22 @@ export class PipesNamespace {
     this._ctx = ctx;
   }
 
-  /** List all registered pipes — of `opts.tenant`, the default tenant without it. */
+  /** List all registered pipes */
   async list(opts?: OpsRequestOptions): Promise<Result<Pipe[]>> {
     const { data, error } = await request<Pipe[]>(this._ctx, {
       method: "GET",
       path: "/v1/ops/pipes",
-      params: tenantParam(opts),
       ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
   }
 
-  /** Get a single pipe definition by name — of `opts.tenant`, the default tenant without it. */
+  /** Get a single pipe definition by name */
   async get(name: string, opts?: OpsRequestOptions): Promise<Result<Pipe>> {
     const { data, error } = await request<Pipe>(this._ctx, {
       method: "GET",
       path: `/v1/ops/pipes/${encodeURIComponent(name)}`,
-      params: tenantParam(opts),
       ...callOpts(opts),
     });
     if (error) return err(error);

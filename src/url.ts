@@ -58,6 +58,28 @@ export function assertBaseHasHost(base: string): void {
   if (hostless(normalizeBaseURL(base))) throw new TypeError(unusableBase(base));
 }
 
+/**
+ * Throw a `TypeError` for a base whose scheme is not `http` or `https`: the
+ * REST client would otherwise retry the failing `fetch` as `NETWORK_ERROR`.
+ * Streams refuse it too. Run at client construction, after `assertBaseHasHost`.
+ *
+ * @internal
+ */
+export function assertBaseScheme(base: string): void {
+  let protocol: string;
+  try {
+    protocol = new URL(normalizeBaseURL(base)).protocol;
+  } catch {
+    // Unparseable bases keep failing where they always did, on first use.
+    return;
+  }
+  if (protocol !== "http:" && protocol !== "https:") {
+    throw new TypeError(
+      `baseURL ${JSON.stringify(base)} must use http or https, got "${protocol}". The SDK speaks plain HTTP: there is no WebSocket endpoint.`,
+    );
+  }
+}
+
 function unusableBase(base: string): string {
   return `baseURL ${JSON.stringify(base)} is not a usable URL: give a host, with an optional scheme, port and path prefix, such as "https://example.com/api". A bare path such as "/api" is not one; it names no host`;
 }

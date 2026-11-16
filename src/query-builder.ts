@@ -320,7 +320,7 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
   liveQuery(subscriber: StreamSubscriber<Row>, opts?: StreamOptions): LiveQuery<Row> {
     const stream = this.stream(opts);
     // The backfill is one more request of this subscription, so it carries the
-    // same headers, deadline and signal: a tenant header must reach it too.
+    // same headers, deadline and signal: a custom header must reach it too.
     const fetchFn = () =>
       this.fetch({
         signal: opts?.signal,
