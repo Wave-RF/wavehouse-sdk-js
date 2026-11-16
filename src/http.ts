@@ -202,24 +202,22 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         return { data: null, error, headers: res.headers };
       }
 
-      // 429 is retried only for a call that may have run (`pipe`): a read
-      // keeps its behaviour, where only 5xx and a server `retryable` resend.
-      if (kind === "pipe" && res.status === 429 && attempt < maxAttempts - 1) {
-        const retryAfter = parseInt(res.headers.get("Retry-After") ?? "", 10);
-        await sleep(retryAfter > 0 ? retryAfter * 1000 : backoff(attempt), opts.signal);
+      // The server's own wait, from Retry-After, for the answers that carry one:
+      // 429 on a call that may have run (`pipe`; a read keeps its behaviour,
+      // where only 5xx and a server `retryable` resend) and any 503.
+      const mayWait = (kind === "pipe" && res.status === 429) || res.status === 503;
+      const retryAfter = res.headers.get("Retry-After");
+      if (mayWait && (res.status === 429 || retryAfter) && attempt < maxAttempts - 1) {
+        const wait = parseRetryAfter(retryAfter, Date.now());
+        const cap = ctx.options.maxRetryAfterMs ?? MAX_BACKOFF_MS;
+        // Sleeping an hour inside a call the caller thinks is short is worse
+        // than handing back the server's answer.
+        if (wait !== undefined && wait > cap) {
+          return { data: null, error, headers: res.headers };
+        }
+        await sleep(wait === undefined ? backoff(attempt) : jitter(wait), opts.signal);
         lastError = error;
         continue;
-      }
-
-      // 503 with Retry-After: wait the specified duration
-      if (res.status === 503) {
-        const retryAfter = res.headers.get("Retry-After");
-        if (retryAfter && attempt < maxAttempts - 1) {
-          const delay = parseInt(retryAfter, 10) * 1000 || 30_000;
-          await sleep(delay, opts.signal);
-          lastError = error;
-          continue;
-        }
       }
 
       // Retryable server errors (5xx)
@@ -277,8 +275,32 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   return { data: null, error: lastError!, headers: new Headers() };
 }
 
+const MAX_BACKOFF_MS = 30_000;
+
 function backoff(attempt: number): number {
-  return Math.min(1000 * 2 ** attempt, 30_000);
+  return Math.min(1000 * 2 ** attempt, MAX_BACKOFF_MS);
+}
+
+/** Spread clients that were told the same wait; never earlier than asked. */
+function jitter(ms: number): number {
+  return ms + Math.random() * (0.2 * ms + 100);
+}
+
+/**
+ * A `Retry-After` value in milliseconds: delta-seconds or an HTTP-date (a date
+ * already past is 0, "retry now"). Undefined when absent or unparseable, which
+ * the caller reads as "no usable hint, back off normally".
+ *
+ * @internal
+ */
+export function parseRetryAfter(value: string | null, now: number): number | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  // Date.parse reads "1.5" or "-3" as some year; an HTTP-date names a month.
+  if (!/[A-Za-z]/.test(v)) return undefined;
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
