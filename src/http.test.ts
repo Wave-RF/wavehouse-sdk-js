@@ -303,4 +303,31 @@ describe("request", () => {
     expect(result.data).toBeUndefined();
     expect(result.error).toBeNull();
   });
+
+  it("leaves no abort listener behind on a shared signal after retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const ac = new AbortController();
+      const added = vi.spyOn(ac.signal, "addEventListener");
+      const removed = vi.spyOn(ac.signal, "removeEventListener");
+      for (let i = 0; i < 12; i++) {
+        fetchSpy
+          .mockResolvedValueOnce(new Response("{}", { status: 503 }))
+          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+        const pending = request(makeCtx({ options: { maxRetries: 1 } }), {
+          method: "GET",
+          path: "/health",
+          signal: ac.signal,
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect((await pending).data).toEqual({ ok: true });
+      }
+      const aborts = (spy: typeof added) => spy.mock.calls.filter((c) => c[0] === "abort").length;
+      expect(aborts(added)).toBeGreaterThan(0);
+      // Every listener `sleep` attached has been taken off again.
+      expect(aborts(removed)).toBe(aborts(added));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
