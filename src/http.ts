@@ -372,8 +372,24 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
 
       if (res.ok) {
         const text = await guard.race(res.text());
-        const data = text ? (JSON.parse(text) as T) : (undefined as T);
-        return { data, error: null, headers: res.headers };
+        if (!text) return { data: undefined as T, error: null, headers: res.headers };
+        // Outside the network catch below: a body that is not JSON (an
+        // intermediary's HTML page, say) is a definite answer, so resending it
+        // would only repeat the request, a write included.
+        try {
+          return { data: JSON.parse(text) as T, error: null, headers: res.headers };
+        } catch {
+          return {
+            data: null,
+            error: {
+              status: res.status,
+              code: "DECODE_ERROR",
+              message: `The server answered ${res.status} with a body that is not valid JSON`,
+              retryable: false,
+            },
+            headers: res.headers,
+          };
+        }
       }
 
       const error = await guard.race(parseErrorResponse(res));

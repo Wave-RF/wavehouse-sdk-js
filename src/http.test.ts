@@ -353,7 +353,10 @@ describe("request redirects", () => {
     vi.unstubAllGlobals();
   });
   const redirect = () =>
-    new Response(null, { status: 307, headers: { Location: "https://other.example/v1/ops/query" } });
+    new Response(null, {
+      status: 307,
+      headers: { Location: "https://other.example/v1/ops/query" },
+    });
 
   it("does not follow a redirect when the call carries a token and headers", async () => {
     fetchSpy.mockImplementation(async () => redirect());
@@ -400,4 +403,24 @@ describe("request redirects", () => {
     await request(makeCtx(), { method: "GET", path: "/x" });
     expect(fetchSpy.mock.calls[0][1].redirect).toBeUndefined();
   });
+});
+
+describe("request with a 200 that is not JSON", () => {
+  it.each(["read", "sql", "pipe"] as const)(
+    "returns DECODE_ERROR once for a %s call",
+    async (kind) => {
+      const fetchSpy = vi.fn(async () => new Response("<html>login</html>", { status: 200 }));
+      vi.stubGlobal("fetch", fetchSpy);
+      const res = await request(makeCtx({ options: { maxRetries: 2 } }), {
+        method: "POST",
+        path: "/x",
+        body: {},
+        kind,
+      });
+      vi.unstubAllGlobals();
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(res.error).toMatchObject({ code: "DECODE_ERROR", status: 200, retryable: false });
+      expect(res.error?.message).not.toContain("login");
+    },
+  );
 });
