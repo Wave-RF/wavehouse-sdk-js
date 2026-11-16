@@ -361,7 +361,11 @@ function generateTypes(schemas: TableSchema[]): string {
       const optional = col.has_default ? "?" : "";
       if (isDecimal(col.type)) {
         lines.push(
-          "  /** A Decimal, which the server sends as a quoted string to keep its precision. */",
+          "  /**",
+          "   * A Decimal. `/v1/query` sends it as a quoted string, to keep its precision.",
+          "   * A stream row carries the value as the producer sent it, and `sql()` returns",
+          "   * ClickHouse JSON numbers.",
+          "   */",
         );
       }
       lines.push(`  ${propertyKey(col.name)}${optional}: ${tsType};`);

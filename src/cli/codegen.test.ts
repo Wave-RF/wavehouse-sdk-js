@@ -406,6 +406,9 @@ describe("generateTypes Decimal columns", () => {
         ],
       },
     ]);
-    expect(out).toMatch(/quoted string[^\n]*\n\s+amount: string;/);
+    expect(out).toMatch(/quoted string[\s\S]*\*\/\n\s+amount: string;/);
+    expect(out).toContain("A stream row carries the value as the producer sent it");
+    expect(out).toContain("`sql()` returns");
+    expect(out).toContain("ClickHouse JSON numbers");
   });
 });
