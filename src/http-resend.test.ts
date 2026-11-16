@@ -62,6 +62,7 @@ describe("resend safety by call kind", () => {
       const { result, calls } = await run(kind, reject(e), ok);
       expect(calls).toBe(1);
       expect(result.error?.code).toBe("NETWORK_ERROR");
+      expect(result.error?.retryable).toBe(false);
     });
   });
 
@@ -117,6 +118,11 @@ describe("resend safety by call kind", () => {
     it("resends any network error", async () => {
       const { calls } = await run("read", reject(failed(sysErr("ECONNRESET"))), ok);
       expect(calls).toBe(2);
+    });
+    it("reports a final network error as retryable", async () => {
+      const e = reject(failed(sysErr("ECONNRESET")));
+      const { result } = await run("read", e, e, e);
+      expect(result.error?.retryable).toBe(true);
     });
     it("resends a bare 5xx", async () => {
       const { calls } = await run("read", () => json(502, {}), ok);

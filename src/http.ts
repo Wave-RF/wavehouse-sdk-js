@@ -243,7 +243,11 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
 
       lastError = networkError(e);
       // The request may have reached the server; resending could run it twice.
-      if (kind !== "read" && !neverSent(e)) break;
+      // Reported as not retryable too: `retryable` tells the caller a resend is safe.
+      if (kind !== "read" && !neverSent(e)) {
+        lastError = { ...lastError, retryable: false };
+        break;
+      }
       if (attempt < maxAttempts - 1) {
         // This sleep is the one that runs inside the catch, so unlike the two
         // in the try above, an abort raised *by* the backoff would escape
