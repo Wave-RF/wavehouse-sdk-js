@@ -140,7 +140,6 @@ function mayResendResponse(kind: CallKind, error: WaveHouseError, res: Response)
 export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<HttpResult<T>> {
   const url = resolveURL(ctx.baseURL, opts.path, opts.params).toString();
   const headers: Record<string, string> = {
-    "Content-Type": opts.contentType ?? "application/json",
     Accept: "application/json",
   };
 
@@ -151,6 +150,13 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       : opts.body !== undefined
         ? JSON.stringify(opts.body)
         : undefined;
+
+  // Only a request with a body describes one. On a bodyless GET the header
+  // would also make a cross-origin browser read preflight, since
+  // application/json is not a CORS-safelisted Content-Type.
+  if (requestBody !== undefined) {
+    headers["Content-Type"] = opts.contentType ?? "application/json";
+  }
 
   if (ctx.auth) {
     const token = await ctx.auth();

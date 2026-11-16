@@ -54,6 +54,17 @@ describe("request", () => {
     expect(init.headers["Content-Type"]).toBe("application/json");
   });
 
+  it("sends no Content-Type on a request without a body", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ status: "ok" }), { status: 200 }));
+
+    await request(makeCtx(), { method: "GET", path: "/health" });
+
+    // A Content-Type here would make a cross-origin browser read preflight.
+    const [, init] = fetchSpy.mock.calls[0];
+    expect(Object.keys(init.headers).map((h) => h.toLowerCase())).not.toContain("content-type");
+    expect(init.headers.Accept).toBe("application/json");
+  });
+
   it("sends rawBody verbatim with a custom Content-Type", async () => {
     fetchSpy.mockResolvedValue(new Response(JSON.stringify({ total: 1 }), { status: 200 }));
 

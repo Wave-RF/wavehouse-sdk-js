@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- A bodyless request (every `GET`, such as `schema.get()` or `pipes.list()`) no longer sends `Content-Type`. `application/json` is not a CORS-safelisted value, so each cross-origin browser read cost a preflight. Requests with a body are unchanged. Fixes #27.
 - `selectAll()` combined with `select()` columns or an aggregation, in either order, now resolves to an `INVALID_QUERY` error without sending a request, instead of reaching the server and failing with a 400. Fixes #31.
 - `wavehouse-codegen` quotes table and column names that are not identifiers (`user-id`, `2fa`, `order id`), and gives tables whose names differ only in case, or that start with a digit, distinct valid interface names. Fixes #37.
 - `wh.sql()` and pipe calls are no longer sent twice. A raw SQL statement is resent only when the connection was never made; a pipe call also when the server answers `retryable: true`, with a 429, or with a 503 and `Retry-After`. A bare 5xx or a dropped connection, which may follow a write that ran, is returned as the error. Fixes #56.
