@@ -176,6 +176,51 @@ describe("SSETransport request construction", () => {
     t.disconnect();
   });
 
+  describe("redirect policy by credential", () => {
+    const cases: Array<{
+      name: string;
+      opts: Record<string, unknown>;
+      browser: boolean;
+      redirect: string;
+    }> = [
+      { name: "nothing", opts: {}, browser: true, redirect: "follow" },
+      { name: "a bearer token", opts: { auth: () => "t" }, browser: false, redirect: "manual" },
+      {
+        name: "configured headers",
+        opts: { headers: { "X-Key": "k" } },
+        browser: false,
+        redirect: "manual",
+      },
+      {
+        name: "credentials include in a browser",
+        opts: { fetchOptions: { credentials: "include" } },
+        browser: true,
+        redirect: "manual",
+      },
+      {
+        name: "credentials include outside a browser",
+        opts: { fetchOptions: { credentials: "include" } },
+        browser: false,
+        redirect: "follow",
+      },
+      {
+        name: "credentials same-origin in a browser",
+        opts: { fetchOptions: { credentials: "same-origin" } },
+        browser: true,
+        redirect: "follow",
+      },
+    ];
+    it.each(cases)("$name -> $redirect", async ({ opts, browser, redirect }) => {
+      if (browser) vi.stubGlobal("window", {});
+      const f = makeFetch();
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl, ...opts });
+      t.connect();
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+      expect(f.attempts[0].init.redirect).toBe(redirect);
+      t.disconnect();
+    });
+  });
+
   it("neutralizes a body from fetchOptions", async () => {
     const f = makeFetch();
     const t = new SSETransport({

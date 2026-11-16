@@ -487,8 +487,14 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     // Anything a redirect target must not be handed: the bearer token, or the
     // configured headers that carry proxy service-token secrets.
+    // An explicit `credentials: "include"` is the documented opt-in to cookie
+    // auth, so it counts too — in a browser only, the one place it is honored.
+    // The implicit `same-origin` default stays invisible: it cannot be told
+    // from a deployment with no cookies at all.
     const credentialed =
-      base.Authorization !== undefined || Object.keys(this._opts.headers ?? {}).length > 0;
+      base.Authorization !== undefined ||
+      Object.keys(this._opts.headers ?? {}).length > 0 ||
+      ("window" in globalThis && this._opts.fetchOptions?.credentials === "include");
 
     const init: RequestInit = {
       ...this._opts.fetchOptions,
@@ -511,12 +517,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       //              convenience. Without either, redirects are followed, so CDN
       //              canonicalization, geo/LB indirection, and an http→https
       //              upgrade all just work. The test is deliberately that
-      //              concrete pair and not "is this authenticated": cookies do
-      //              not appear in it. A cookie is re-derived per
-      //              destination rather than carried, so under the default
-      //              same-origin credentials mode it survives a redirect only
-      //              while the hop stays inside both the request's origin and
-      //              the cookie's Path; outside either the stream is
+      //              concrete set and not "is this authenticated": an explicit
+      //              `credentials: "include"` is in it, but cookies relied on
+      //              through the implicit same-origin default are not. A cookie
+      //              is re-derived per destination rather than carried, so under
+      //              the default same-origin credentials mode it survives a
+      //              redirect only while the hop stays inside both the request's
+      //              origin and the cookie's Path; outside either the stream is
       //              silently unauthed. See #478 and the SDK guide under
       //              "Supplying your own fetch".
       //              `manual` over `error` for the credentialed case so the
