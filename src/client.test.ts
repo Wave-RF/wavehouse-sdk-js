@@ -361,7 +361,7 @@ describe("stream error delivery", () => {
     // constructor — so the error fired before `.stream()` had returned and no
     // subscriber could ever see it. Every transport-level test attaches its
     // callbacks before `connect()`, which is exactly why they missed it.
-    const wh = createClient({ baseURL: "not-a-url" });
+    const wh = createClient({ baseURL: "https://[" });
     const stream = wh.from("clicks").stream();
 
     const errors: unknown[] = [];

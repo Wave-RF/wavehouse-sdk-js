@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- A `baseURL` with no scheme is accepted: `http://` is prepended for a loopback host (`localhost`, `127.0.0.0/8`, `::1`, `*.localhost`), `https://` for any other, and an explicit scheme is never changed, so `localhost:8080` no longer fails as a URL with the scheme `localhost:`. A `baseURL` that is still unusable now throws an error naming what is expected. `wavehouse-sdk-go` resolves the same inputs to the same base. Fixes #24.
 - A `429 Too Many Requests` is now retryable on REST reads and ingest (unless the body says `retryable: false`): the SDK waits the `Retry-After` it carries, capped by `maxRetryAfterMs` (30 s by default), then resends, and a 429 that is returned reports `retryable: true`. Raw SQL is still never resent. Fixes #40 and the REST half of #43.
 - `wavehouse-codegen` types a `Decimal` column as `string`, not `number`: the server sends Decimals as quoted strings, so `number` hid a string at runtime. The generated field carries a comment saying so. Fixes #39.
 - A bodyless request (every `GET`, such as `schema.get()` or `pipes.list()`) no longer sends `Content-Type`. `application/json` is not a CORS-safelisted value, so each cross-origin browser read cost a preflight. Requests with a body are unchanged. Fixes #27.

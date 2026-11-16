@@ -1189,7 +1189,7 @@ describe("SSETransport lifecycle", () => {
   it("ends the stream on a baseURL that cannot resolve", async () => {
     vi.useFakeTimers();
     const f = makeFetch();
-    const t = new SSETransport({ baseURL: "not-a-url", table: "clicks", fetch: f.impl });
+    const t = new SSETransport({ baseURL: "https://[", table: "clicks", fetch: f.impl });
     const seen = collect(t);
     t.connect();
     await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
