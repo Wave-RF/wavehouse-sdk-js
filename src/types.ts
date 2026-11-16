@@ -83,7 +83,17 @@ export interface ClientConfig<_DB extends Database = Database> {
    * one: `` `${location.origin}/api/warehouse` ``.
    */
   baseURL: string;
-  /** Auth token provider. Omit for public/unauthenticated access. */
+  /**
+   * Auth token provider. Omit for public/unauthenticated access.
+   *
+   * The contract: the SDK calls it **before every attempt** — each retry of a
+   * REST call and each (re)connect of a stream runs it again, so a token that
+   * changed in between is the one sent. It must therefore be cheap: caching,
+   * refreshing and de-duplicating concurrent refreshes are the implementer's
+   * job, not the SDK's. Return an empty string to send no `Authorization`
+   * header. A rejection throws out of a REST call (it is never retried) and is
+   * a retryable `SSE_AUTH_ERROR` on a stream.
+   */
   auth?: () => Promise<string> | string;
   /** Additional client options. */
   options?: ClientOptions;

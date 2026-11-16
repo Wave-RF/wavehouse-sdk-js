@@ -130,17 +130,21 @@ const { data: build } = await acme.version(); // GET /version: { version, git_co
 
 Admin calls (`/v1/ops/*`) ignore the header and take a per-call `opts.tenant`, sent as `?tenant=`.
 
-### Timeouts
+### Authentication and timeouts
 
 ```ts
 const wh = createClient({
   baseURL: 'http://localhost:8080',
+  // Runs before EVERY attempt: each retry, and each stream (re)connect.
+  auth: () => tokenCache.get(),
   options: { attemptTimeoutMs: 8_000 }, // each attempt gets its own deadline; off by default
 });
 
 // Or for one call, through .fetch({ ... }): `await`ing a builder takes no options.
 await wh.from('clicks').select('*').fetch({ attemptTimeoutMs: 2_000 });
 ```
+
+`auth` is called before every attempt, so a token that changed during a backoff is the one a retry sends. It must be cheap: caching and refreshing are yours to do, not the SDK's.
 
 `attemptTimeoutMs` bounds one attempt, from sending to the end of the body. A stalled attempt is retried after a backoff while `maxRetries` allows, and the final error is `ATTEMPT_TIMEOUT`, naming the attempt count. Your `signal` still ends the call at once with `ABORTED`. `wh.sql()` and pipe calls are not resent after a timeout, since the request may have run. For streams it bounds each connect up to the response headers, never an established stream.
 

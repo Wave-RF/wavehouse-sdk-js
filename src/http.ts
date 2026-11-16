@@ -219,17 +219,6 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
     headers["Content-Type"] = opts.contentType ?? "application/json";
   }
 
-  if (ctx.auth) {
-    const token = await ctx.auth();
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
-    }
-  }
-
-  // After auth, so `auth` keeps ownership of Authorization, and after the
-  // Content-Type/Accept this request needs.
-  const finalHeaders = mergeHeaders(headers, ctx.options.headers);
-
   const kind = opts.kind ?? "read";
   let lastError: WaveHouseError | null = null;
   const maxAttempts = ctx.options.maxRetries + 1;
@@ -237,6 +226,23 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   const timeoutMs = attemptTimeout(opts.attemptTimeoutMs ?? ctx.options.attemptTimeoutMs);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Resolved before every attempt, not once per call: a token that changed
+    // during a backoff is the one a retry sends. Outside the `try` below, so a
+    // rejection throws out of `request` as it always has instead of being
+    // retried as a network error. `auth` is called synchronously on the first
+    // attempt: a liveQuery depends on which of the stream and the backfill
+    // reaches it first.
+    const sdkHeaders = { ...headers };
+    if (ctx.auth) {
+      const token = await ctx.auth();
+      if (token) {
+        sdkHeaders.Authorization = `Bearer ${token}`;
+      }
+    }
+    // After auth, so `auth` keeps ownership of Authorization, and after the
+    // Content-Type/Accept this request needs.
+    const finalHeaders = mergeHeaders(sdkHeaders, ctx.options.headers);
+
     const guard = attemptGuard(opts.signal, timeoutMs);
     try {
       // Configured RequestInit first, so the fields the SDK controls overwrite

@@ -12,6 +12,7 @@
 
 ### Changed
 
+- `auth` runs before every attempt of a REST call, not once before the retry loop: each retry calls it again, so a token that changed during a backoff is the one sent. Streams already called it on every connect. The contract is now documented on `ClientConfig.auth`: it must be cheap, and caching or refreshing is the implementer's job. A rejection on a retry throws out of the call, as on the first attempt.
 - A stream treats a data frame that arrives before any `event: schema` frame, a row that is not an array, or a row whose length disagrees with the announced columns as a protocol error: it reports a retryable `SSE_PROTOCOL_ERROR` and reconnects from the last delivered event, as `wavehouse-sdk-go` does, where it used to warn and drop the frame. The refused frame does not move the resume point. The `no-schema` warning and the README's notes on SDK and server version skew, which described the pre-`event: schema` stream format, are removed.
 - `orderBy()` lowercases its direction and resolves a direction other than `asc` or `desc` to an `INVALID_QUERY` error before anything is sent. The server read `"DESC"` as ascending.
 - `aggregate()` with an empty alias omits `alias` from the request instead of sending `""`.
