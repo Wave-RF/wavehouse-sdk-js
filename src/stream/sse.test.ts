@@ -1400,3 +1400,96 @@ describe("SSETransport hostile column names", () => {
     t.disconnect();
   });
 });
+
+describe("SSETransport early reconnect", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  /** A live connection whose response carries the given headers. */
+  function liveWith(headers: Record<string, string>) {
+    const s = streamingResponse();
+    const res = new Response(s.res.body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream", ...headers },
+    });
+    return { ...s, res };
+  }
+
+  it("resumes from the first connection's Date header when no event arrived", async () => {
+    const f = makeFetch();
+    const first = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
+    f.queue.push(() => first.res);
+
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    expect(new URL(f.attempts[0].url).searchParams.get("since")).toBeNull();
+
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:07.000Z");
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
+    t.disconnect();
+  });
+
+  it("falls back to local time less 5s without a Date header", async () => {
+    vi.setSystemTime(new Date("2026-08-01T00:01:00Z"));
+    const f = makeFetch();
+    const first = liveWith({});
+    f.queue.push(() => first.res);
+
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+
+    // The fake clock advances a little before the connection goes live.
+    const since = new URL(f.attempts[1].url).searchParams.get("since") ?? "";
+    expect(Date.parse(since) - Date.parse("2026-08-01T00:00:55Z")).toBeLessThan(1000);
+    expect(Date.parse(since)).toBeGreaterThanOrEqual(Date.parse("2026-08-01T00:00:55Z"));
+    t.disconnect();
+  });
+
+  it("keeps the caller's since, and prefers Last-Event-ID once an event arrived", async () => {
+    const f = makeFetch();
+    const first = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
+    f.queue.push(() => first.res);
+
+    const t = new SSETransport({
+      baseURL: BASE,
+      table: "clicks",
+      since: "2026-07-01T00:00:00Z",
+      fetch: f.impl,
+    });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-07-01T00:00:00Z");
+    t.disconnect();
+
+    const g = makeFetch();
+    const one = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
+    g.queue.push(() => one.res);
+    const t2 = new SSETransport({ baseURL: BASE, table: "clicks", fetch: g.impl });
+    const seen = collect(t2);
+    t2.connect();
+    await vi.waitFor(() => expect(g.attempts).toHaveLength(1));
+    one.push(rowFrames("2026-08-01T00:00:09Z", "2026-08-01T00:00:09Z", { n: 1 }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+    one.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(g.attempts).toHaveLength(2));
+    expect(headersOf(g.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
+    t2.disconnect();
+  });
+});

@@ -81,15 +81,24 @@ describe("QueryBuilder", () => {
       ["<=", "lte"],
       ["in", "in"],
       ["like", "like"],
-      ["not_like", "not_like"],
     ] as const;
 
+    // The operators the server's filter builder implements; it answers any
+    // other with "unsupported operator", which is a 400 at runtime.
+    const serverOps = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "like", "in"]);
+
     for (const [sdkOp, backendOp] of ops) {
+      expect(serverOps.has(backendOp)).toBe(true);
       fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
       await builder().where("col", sdkOp, "v").fetch();
       const body = JSON.parse(fetchSpy.mock.calls.at(-1)![1].body);
       expect(body.filters[0].op).toBe(backendOp);
     }
+  });
+
+  it("does not offer not_like, which the server rejects on queries", () => {
+    // @ts-expect-error not_like is not a FilterOp
+    builder().where("col", "not_like", "%x%");
   });
 
   it("accumulates multiple where clauses", async () => {
@@ -396,6 +405,34 @@ describe("QueryBuilder", () => {
     expect(received[0].page).toBe("/home");
   });
 
+  describe("selectAll() exclusivity", () => {
+    const cases: [string, () => QueryBuilder][] = [
+      ["select() then selectAll()", () => builder().select("page").selectAll()],
+      ["selectAll() then select()", () => builder().selectAll().select("page")],
+      ["selectAll() then count()", () => builder().selectAll().count()],
+      ["count() then selectAll()", () => builder().count().selectAll()],
+    ];
+
+    it.each(cases)("%s resolves to INVALID_QUERY and sends nothing", async (_name, make) => {
+      const result = await make().fetch();
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("INVALID_QUERY");
+      expect(result.error?.retryable).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("still sends selectAll() alone, and with filters and ordering", async () => {
+      await builder().selectAll().where("score", ">", 1).orderBy("score").fetch();
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.select_all).toBe(true);
+      expect(body.columns).toBeUndefined();
+    });
+  });
+
+  it("offers no cacheTTL(): the server picks the cache TTL, so a setter could only mislead", () => {
+    expect("cacheTTL" in builder()).toBe(false);
+  });
+
   // --- Complex chain ---
 
   it("builds a complex query", async () => {
@@ -407,7 +444,6 @@ describe("QueryBuilder", () => {
       .orderBy("total", "desc")
       .limit(50)
       .timeRange("received_timestamp", "1h")
-      .cacheTTL(60)
       .fetch();
 
     const body = JSON.parse(fetchSpy.mock.calls[0][1].body);

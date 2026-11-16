@@ -6,7 +6,13 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["src/**", "scripts/**/*.{ts,js,mjs,cjs}", "*.{ts,js,mjs,cjs,json}"]
+    "includes": [
+      "src/**",
+      "e2e/**",
+      "!e2e/testdata",
+      "scripts/**/*.{ts,js,mjs,cjs}",
+      "*.{ts,js,mjs,cjs,json}"
+    ]
   },
   "formatter": {
     "enabled": true,

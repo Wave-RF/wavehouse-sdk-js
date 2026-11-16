@@ -39,8 +39,11 @@ export interface WaveHouseError {
 
 // --- Filter operators ---
 
-/** SDK filter operators (translated to backend equivalents). */
-export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "like" | "not_like";
+/**
+ * SDK filter operators (translated to backend equivalents): the set the
+ * server's structured-query endpoint accepts. There is no negated `like`.
+ */
+export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "like";
 
 // --- Streaming types ---
 
@@ -129,6 +132,14 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 export interface ClientOptions {
   /** Maximum retry attempts for failed requests. Default: 2. */
   maxRetries?: number;
+  /**
+   * Longest `Retry-After` wait, in milliseconds, a REST call will sit through
+   * before retrying a 503 (or a 429 on a pipe call). When the server asks for
+   * more, the call returns that response as its error instead of sleeping.
+   * `Retry-After` may be seconds or an HTTP-date. Default: 30000, the backoff
+   * ceiling.
+   */
+  maxRetryAfterMs?: number;
   /**
    * HTTP implementation used for every request, REST and streaming alike.
    * Defaults to the global `fetch`.
@@ -503,6 +514,7 @@ export interface HttpContext {
   // `fetch` stays optional rather than defaulted here, to keep the global late-bound.
   options: {
     maxRetries: number;
+    maxRetryAfterMs?: number;
     fetch?: FetchLike;
     headers?: Record<string, string>;
     fetchOptions?: RequestInit;

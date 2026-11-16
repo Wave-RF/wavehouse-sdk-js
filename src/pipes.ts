@@ -44,6 +44,7 @@ export class PipeRef<Row = Record<string, unknown>> implements PromiseLike<Resul
       method: "POST",
       path: `/v1/pipes/${encodeURIComponent(this._name)}`,
       body: this._params ?? {},
+      kind: "pipe",
       signal: opts?.signal,
     });
     if (error) return err(error);

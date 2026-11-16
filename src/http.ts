@@ -16,7 +16,16 @@ interface RequestSpec {
   contentType?: string;
   params?: Record<string, string>;
   signal?: AbortSignal;
+  /**
+   * How safely a call can be sent twice. `read` (the default, and ingest, which
+   * dedupes) retries as before. `sql` and `pipe` may run a write, so they are
+   * resent only when the first attempt certainly did nothing — see `mayResend`.
+   */
+  kind?: CallKind;
 }
+
+/** @internal */
+export type CallKind = "read" | "pipe" | "sql";
 
 /** @internal */
 export interface HttpResult<T> {
@@ -81,6 +90,49 @@ function abortedResult<T>(): HttpResult<T> {
   };
 }
 
+// Errors from a connection that was never made, so no byte of the request left.
+const NEVER_SENT_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * True only when `fetch` failed before connecting. Node/undici put the system
+ * error on `cause` (an AggregateError of them when several addresses were
+ * tried); a browser's bare TypeError says nothing, so it reads as "may have
+ * been sent".
+ */
+function neverSent(e: unknown): boolean {
+  const seen = new Set<unknown>();
+  const check = (err: unknown): boolean => {
+    if (typeof err !== "object" || err === null || seen.has(err)) return false;
+    seen.add(err);
+    const { code, cause, errors } = err as { code?: unknown; cause?: unknown; errors?: unknown };
+    if (typeof code === "string" && NEVER_SENT_CODES.has(code)) return true;
+    if (Array.isArray(errors) && errors.length > 0 && errors.every(check)) return true;
+    return check(cause);
+  };
+  return check(e);
+}
+
+/**
+ * Whether an error answer may be sent again. A raw SQL statement or a write
+ * pipe may already have run, and a gateway can answer 5xx after it did, so
+ * those resend only on the server's own word that it is safe.
+ */
+function mayResendResponse(kind: CallKind, error: WaveHouseError, res: Response): boolean {
+  if (kind === "read") return true;
+  if (kind === "sql") return false;
+  const body = error.details as { retryable?: unknown } | undefined;
+  const serverSaid = typeof body?.retryable === "boolean";
+  if (serverSaid) return body?.retryable === true;
+  return res.status === 429 || (res.status === 503 && res.headers.has("Retry-After"));
+}
+
 /**
  * Internal fetch wrapper with auth injection, retry, backoff, and Retry-After.
  * @internal
@@ -88,7 +140,6 @@ function abortedResult<T>(): HttpResult<T> {
 export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<HttpResult<T>> {
   const url = resolveURL(ctx.baseURL, opts.path, opts.params).toString();
   const headers: Record<string, string> = {
-    "Content-Type": opts.contentType ?? "application/json",
     Accept: "application/json",
   };
 
@@ -99,6 +150,13 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       : opts.body !== undefined
         ? JSON.stringify(opts.body)
         : undefined;
+
+  // Only a request with a body describes one. On a bodyless GET the header
+  // would also make a cross-origin browser read preflight, since
+  // application/json is not a CORS-safelisted Content-Type.
+  if (requestBody !== undefined) {
+    headers["Content-Type"] = opts.contentType ?? "application/json";
+  }
 
   if (ctx.auth) {
     const token = await ctx.auth();
@@ -111,6 +169,7 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   // Content-Type/Accept this request needs.
   const finalHeaders = mergeHeaders(headers, ctx.options.headers);
 
+  const kind = opts.kind ?? "read";
   let lastError: WaveHouseError | null = null;
   const maxAttempts = ctx.options.maxRetries + 1;
 
@@ -139,15 +198,26 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
 
       const error = await parseErrorResponse(res);
 
-      // 503 with Retry-After: wait the specified duration
-      if (res.status === 503) {
-        const retryAfter = res.headers.get("Retry-After");
-        if (retryAfter && attempt < maxAttempts - 1) {
-          const delay = parseInt(retryAfter, 10) * 1000 || 30_000;
-          await sleep(delay, opts.signal);
-          lastError = error;
-          continue;
+      if (!mayResendResponse(kind, error, res)) {
+        return { data: null, error, headers: res.headers };
+      }
+
+      // The server's own wait, from Retry-After, for the answers that carry one:
+      // 429 on a call that may have run (`pipe`; a read keeps its behaviour,
+      // where only 5xx and a server `retryable` resend) and any 503.
+      const mayWait = (kind === "pipe" && res.status === 429) || res.status === 503;
+      const retryAfter = res.headers.get("Retry-After");
+      if (mayWait && (res.status === 429 || retryAfter) && attempt < maxAttempts - 1) {
+        const wait = parseRetryAfter(retryAfter, Date.now());
+        const cap = ctx.options.maxRetryAfterMs ?? MAX_BACKOFF_MS;
+        // Sleeping an hour inside a call the caller thinks is short is worse
+        // than handing back the server's answer.
+        if (wait !== undefined && wait > cap) {
+          return { data: null, error, headers: res.headers };
         }
+        await sleep(wait === undefined ? backoff(attempt) : jitter(wait), opts.signal);
+        lastError = error;
+        continue;
       }
 
       // Retryable server errors (5xx)
@@ -176,6 +246,12 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       }
 
       lastError = networkError(e);
+      // The request may have reached the server; resending could run it twice.
+      // Reported as not retryable too: `retryable` tells the caller a resend is safe.
+      if (kind !== "read" && !neverSent(e)) {
+        lastError = { ...lastError, retryable: false };
+        break;
+      }
       if (attempt < maxAttempts - 1) {
         // This sleep is the one that runs inside the catch, so unlike the two
         // in the try above, an abort raised *by* the backoff would escape
@@ -199,8 +275,32 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   return { data: null, error: lastError!, headers: new Headers() };
 }
 
+const MAX_BACKOFF_MS = 30_000;
+
 function backoff(attempt: number): number {
-  return Math.min(1000 * 2 ** attempt, 30_000);
+  return Math.min(1000 * 2 ** attempt, MAX_BACKOFF_MS);
+}
+
+/** Spread clients that were told the same wait; never earlier than asked. */
+function jitter(ms: number): number {
+  return ms + Math.random() * (0.2 * ms + 100);
+}
+
+/**
+ * A `Retry-After` value in milliseconds: delta-seconds or an HTTP-date (a date
+ * already past is 0, "retry now"). Undefined when absent or unparseable, which
+ * the caller reads as "no usable hint, back off normally".
+ *
+ * @internal
+ */
+export function parseRetryAfter(value: string | null, now: number): number | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  // Date.parse reads "1.5" or "-3" as some year; an HTTP-date names a month.
+  if (!/[A-Za-z]/.test(v)) return undefined;
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

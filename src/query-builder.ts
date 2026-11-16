@@ -27,7 +27,6 @@ const OP_MAP: Record<FilterOp, string> = {
   "<=": "lte",
   in: "in",
   like: "like",
-  not_like: "not_like",
 };
 
 interface QueryState {
@@ -40,7 +39,6 @@ interface QueryState {
   orderBy: OrderClause[];
   limit?: number;
   timeRange?: TimeRange;
-  cacheTTL?: number;
 }
 
 type CreateStreamFn<Row> = (table: string, opts?: StreamOptions) => StreamController<Row>;
@@ -73,7 +71,9 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
    * Select every column the caller's role is allowed to read (the all-columns
    * wildcard). Use this instead of `.select(...)` when you want a full-row read;
    * a bare `.fetch()` with no `.select()` does this implicitly. Mutually
-   * exclusive with `.select(...)`.
+   * exclusive with `.select(...)` and the aggregation methods: a query that
+   * combines them, in either order, resolves to an `INVALID_QUERY` error
+   * without being sent.
    */
   selectAll(): QueryBuilder<Row> {
     return this._clone({ selectAll: true });
@@ -128,16 +128,26 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
     return this._clone({ timeRange: { column, since, until } });
   }
 
-  cacheTTL(seconds: number): QueryBuilder<Row> {
-    return this._clone({ cacheTTL: seconds });
-  }
-
   // --- Execution ---
 
   /** Default row limit when none is specified — deliberately tighter than the backend's DefaultMaxRows (10000) safety cap. */
   static readonly DEFAULT_LIMIT = 1000;
 
   async fetch(opts?: RequestOptions): Promise<Result<Row[]>> {
+    // The server refuses select_all next to columns or aggregations with a
+    // 400; saying so here, in either call order, saves the round trip and
+    // names the cause.
+    if (
+      this._state.selectAll &&
+      (this._state.columns.length > 0 || this._state.aggregations.length > 0)
+    ) {
+      return err({
+        status: 0,
+        code: "INVALID_QUERY",
+        message: "selectAll() can't be combined with select() columns or aggregations",
+        retryable: false,
+      });
+    }
     const effectiveLimit = opts?.limit ?? this._state.limit ?? QueryBuilder.DEFAULT_LIMIT;
     const ast = this._buildAST(effectiveLimit);
 
@@ -344,12 +354,6 @@ function evaluateFilter(actual: unknown, op: string, expected: unknown): boolean
       const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = escaped.replace(/%/g, ".*").replace(/_/g, ".");
       return new RegExp(`^${pattern}$`, "i").test(actual);
-    }
-    case "not_like": {
-      if (typeof actual !== "string" || typeof expected !== "string") return false;
-      const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = escaped.replace(/%/g, ".*").replace(/_/g, ".");
-      return !new RegExp(`^${pattern}$`, "i").test(actual);
     }
     default:
       return true; // unknown op — pass through

@@ -37,7 +37,7 @@
   "scripts": {
     "build": "pnpm run clean && tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p e2e",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -47,7 +47,8 @@
     "prepublishOnly": "pnpm run typecheck && pnpm run build",
     "codegen": "tsx src/cli/codegen.ts",
     "lint": "biome check --error-on-warnings .",
-    "fix": "biome check --write ."
+    "fix": "biome check --write .",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "dependencies": {
     "eventsource-parser": "^3.1.1"
@@ -56,6 +57,7 @@
     "@biomejs/biome": "^2.5.15",
     "@types/node": "^26.6.5",
     "@vitest/coverage-v8": "^5.0.4",
+    "testcontainers": "^12.2.1",
     "tsup": "^9.0.0",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",

@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chTypeToTS, fetchSchemas, generateTypes, parseArgs } from "./codegen.js";
+import {
+  chTypeToTS,
+  fetchSchemas,
+  generateTypes,
+  parseArgs,
+  resolveCredentials,
+} from "./codegen.js";
 
 // The server's /v1/ops/schema wire shape: a JSON ARRAY of tables (Go
 // SchemaRegistry.List() → []TableSchema), not a name-keyed map. Regression
@@ -167,6 +173,7 @@ describe("parseArgs", () => {
       url: "http://wh:8080",
       out: "./db.d.ts",
       auth: "tok",
+      authFromArgv: true,
       operatorKey: "op-key",
       tenant: "acme",
     });
@@ -180,7 +187,7 @@ describe("parseArgs", () => {
     ["--tenant", "-t"],
     ["--operator-key", "-k"],
   ];
-  const everyFlag = [...valueFlags.flat(), "--help", "-h"];
+  const everyFlag = [...valueFlags.flat(), "--auth-stdin", "--help", "-h"];
 
   // An unset shell variable is how a flag loses its value: quoted it leaves
   // "", unquoted it lets the flag after it slide into the value's place
@@ -206,6 +213,87 @@ describe("parseArgs", () => {
       tenant: "-acme",
       operatorKey: "-x9_Tq",
     });
+  });
+});
+
+describe("resolveCredentials", () => {
+  const noStdin = async () => {
+    throw new Error("stdin must not be read");
+  };
+  const parse = (...flags: string[]) => parseArgs(["node", "codegen.ts", ...flags]);
+
+  it("reads the admin token from WAVEHOUSE_ADMIN_TOKEN without warning", async () => {
+    const warn = vi.fn();
+    const creds = await resolveCredentials(
+      parse(),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      noStdin,
+      warn,
+    );
+    expect(creds.auth).toBe("env-tok");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("reads the token from stdin for --auth-stdin", async () => {
+    const creds = await resolveCredentials(
+      parse("--auth-stdin"),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      async () => "stdin-tok",
+      vi.fn(),
+    );
+    expect(creds.auth).toBe("stdin-tok");
+  });
+
+  it("refuses an empty stdin token and --auth-stdin together with --auth", async () => {
+    await expect(
+      resolveCredentials(parse("--auth-stdin"), {}, async () => "", vi.fn()),
+    ).rejects.toThrow(/empty token/);
+    await expect(
+      resolveCredentials(parse("--auth-stdin", "--auth", "t"), {}, async () => "x", vi.fn()),
+    ).rejects.toThrow(/alternatives/);
+  });
+
+  it("still honours --auth, and says it is deprecated", async () => {
+    const warn = vi.fn();
+    const creds = await resolveCredentials(
+      parse("--auth", "argv-tok"),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      noStdin,
+      warn,
+    );
+    expect(creds.auth).toBe("argv-tok");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/--auth is deprecated/));
+  });
+
+  it("takes the operator key from the flag, else WAVEHOUSE_OPERATOR_KEY", async () => {
+    const env = { WAVEHOUSE_OPERATOR_KEY: "env-key" };
+    expect((await resolveCredentials(parse(), env, noStdin, vi.fn())).operatorKey).toBe("env-key");
+    expect(
+      (await resolveCredentials(parse("-k", "flag-key"), env, noStdin, vi.fn())).operatorKey,
+    ).toBe("flag-key");
+  });
+
+  it("sends no credential when none is given", async () => {
+    expect(await resolveCredentials(parse(), {}, noStdin, vi.fn())).toEqual({
+      auth: undefined,
+      operatorKey: undefined,
+    });
+  });
+});
+
+describe("parseArgs unknown arguments", () => {
+  const argv = (...flags: string[]) => ["node", "codegen.ts", ...flags];
+
+  // Each of these used to parse cleanly and fall back to tenant 0 or no key.
+  it.each([
+    [["--tenat", "acme"]],
+    [["--tenant-id", "acme"]],
+    [["-T", "acme"]],
+    [["--tenant=acme"]],
+    [["acme"]],
+    [["--operator-ket", "k", "--tenant", "acme"]],
+  ])("refuses %j rather than skipping it", (flags) => {
+    expect(() => parseArgs(argv(...flags))).toThrow(/unknown argument/);
   });
 });
 
@@ -240,6 +328,50 @@ describe("generateTypes", () => {
 
     expect(out.indexOf("  a_b: ABRow;")).toBeGreaterThan(-1);
     expect(out.indexOf("  a_b: ABRow;")).toBeLessThan(out.indexOf("  ab: AbRow;"));
+  });
+});
+
+describe("generateTypes with names that are not identifiers", () => {
+  const col = (name: string) => ({ name, type: "String", is_nullable: false, has_default: false });
+
+  it("quotes table and column names that are not bare identifiers", () => {
+    const out = generateTypes([
+      { name: "my-table", columns: [col("user-id"), col("2fa"), col("order id"), col("plain")] },
+    ]);
+    expect(out).toContain('"my-table": MyTableRow;');
+    expect(out).toContain('  "user-id": string;');
+    expect(out).toContain('  "2fa": string;');
+    expect(out).toContain('  "order id": string;');
+    expect(out).toContain("  plain: string;");
+  });
+
+  it("keeps a hostile name from adding declarations", () => {
+    const out = generateTypes([
+      { name: "t", columns: [col("x: string; }\nexport const evil = 1; {")] },
+    ]);
+    expect(out).not.toMatch(/^export const evil/m);
+    // One interface per table plus Database, no more.
+    expect(out.match(/^export interface /gm)).toHaveLength(2);
+  });
+
+  it("gives tables that differ only in case distinct interface names", () => {
+    const out = generateTypes([
+      { name: "user_events", columns: [col("a")] },
+      { name: "USER_EVENTS", columns: [col("b")] },
+    ]);
+    const names = [...out.matchAll(/^export interface (\w+) \{/gm)].map((m) => m[1]);
+    expect(names).toHaveLength(3);
+    expect(new Set(names).size).toBe(3);
+  });
+
+  it("emits a valid interface name for a name that starts with a digit or has no letters", () => {
+    const out = generateTypes([
+      { name: "2024_logs", columns: [col("a")] },
+      { name: "--", columns: [col("a")] },
+    ]);
+    for (const m of out.matchAll(/^export interface (\S+) \{/gm)) {
+      expect(m[1]).toMatch(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
+    }
   });
 });
 
