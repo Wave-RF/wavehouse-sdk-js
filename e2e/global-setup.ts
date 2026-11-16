@@ -64,11 +64,16 @@ async function startStack(): Promise<{ url: string; stop: () => Promise<void> }>
     const image = process.env.WAVEHOUSE_IMAGE || DEFAULT_SERVER_IMAGE;
     const settingsDir = join(dirname(fileURLToPath(import.meta.url)), "testdata", "settings");
     let server: StartedTestContainer | undefined;
+    // A container that fails its wait is never returned, so capture its output as it runs.
+    const serverLogs: string[] = [];
     try {
       const builder = new GenericContainer(image)
         .withNetwork(network)
         .withExposedPorts(8080)
         .withEnvironment({ WH_DATA_DIR: "/app/data" })
+        .withLogConsumer((stream) => {
+          stream.on("data", (line) => serverLogs.push(String(line)));
+        })
         // Copied in as root; the server runs as nonroot and must be able to read them.
         .withCopyFilesToContainer(
           SETTINGS.map((f) => ({
@@ -84,6 +89,7 @@ async function startStack(): Promise<{ url: string; stop: () => Promise<void> }>
         : builder
       ).start();
     } catch (e) {
+      process.stderr.write(`e2e: server logs:\n${serverLogs.join("")}\n`);
       throw new Error(`starting ${image}: ${e instanceof Error ? e.message : e}`);
     }
     cleanups.push(() => server!.stop());
