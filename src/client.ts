@@ -50,11 +50,18 @@ export class WaveHouseClient<DB extends Database = Database> {
         `baseURL ${JSON.stringify(config.baseURL)} must not carry a query string or fragment: give the origin and an optional path prefix, such as "https://example.com/api"`,
       );
     }
+    // A negative or fractional count would make the retry loop run zero times.
+    const maxRetries = config.options?.maxRetries;
+    if (maxRetries !== undefined && (!Number.isInteger(maxRetries) || maxRetries < 0)) {
+      throw new TypeError(
+        `options.maxRetries must be a non-negative integer, got ${String(maxRetries)}`,
+      );
+    }
     this._ctx = {
       baseURL: config.baseURL.replace(/\/+$/, ""),
       auth: config.auth,
       options: {
-        maxRetries: config.options?.maxRetries ?? 2,
+        maxRetries: maxRetries ?? 2,
         maxRetryAfterMs: config.options?.maxRetryAfterMs,
         attemptTimeoutMs: config.options?.attemptTimeoutMs,
         fetch: config.options?.fetch,

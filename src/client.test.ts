@@ -50,6 +50,20 @@ describe("createClient", () => {
     expect(client._ctx.options.maxRetries).toBe(2);
   });
 
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects maxRetries %s at construction",
+    (n) => {
+      expect(() =>
+        createClient({ baseURL: "http://localhost:8080", options: { maxRetries: n } }),
+      ).toThrow(/maxRetries must be a non-negative integer/);
+    },
+  );
+
+  it("accepts maxRetries 0", () => {
+    const client = createClient({ baseURL: "http://localhost:8080", options: { maxRetries: 0 } });
+    expect(client._ctx.options.maxRetries).toBe(0);
+  });
+
   it("respects custom maxRetries", () => {
     const client = createClient({
       baseURL: "http://localhost:8080",

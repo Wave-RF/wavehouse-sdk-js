@@ -424,3 +424,18 @@ describe("request with a 200 that is not JSON", () => {
     },
   );
 });
+
+describe("request with an unusable maxRetries", () => {
+  it("still makes one attempt and returns a result, never null data and null error", async () => {
+    const fetchSpy = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const res = await request(makeCtx({ options: { maxRetries: -1 } }), {
+      method: "GET",
+      path: "/x",
+    });
+    vi.unstubAllGlobals();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(res.error).toBeNull();
+    expect(res.data).toEqual({});
+  });
+});

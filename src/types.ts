@@ -152,7 +152,7 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 export type HeadersProvider = () => Record<string, string> | Promise<Record<string, string>>;
 
 export interface ClientOptions {
-  /** Maximum retry attempts for failed requests. Default: 2. */
+  /** Maximum retry attempts for failed requests: a non-negative integer, else the client throws. Default: 2. */
   maxRetries?: number;
   /**
    * A deadline for each attempt on its own, in milliseconds, so a stalled

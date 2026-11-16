@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- `options.maxRetries` is validated at construction: a negative, fractional or non-finite value throws a `TypeError` naming it. A negative count used to make a call return neither data nor an error, so `.fetch()` threw a `TypeError` on `null`. `wavehouse-sdk-go` rejects the same values in `New`.
 - A `200` whose body is not JSON (an intermediary's HTML page, say) returns a non-retryable `DECODE_ERROR` carrying the status, and the request is sent once. It used to be classed as a `NETWORK_ERROR` and retried, a write included. `wavehouse-sdk-go` already behaved this way.
 - A REST call that carries a credential (an `auth` token, `options.headers` or per-call `headers`, or in a browser `credentials: "include"`) no longer follows a redirect: it sets `redirect: "manual"` and returns a non-retryable `REDIRECT` error naming the status and `Location`, as streams (`SSE_REDIRECT`) and `wavehouse-sdk-go` do. It used to forward custom headers and re-send the body, a raw SQL statement included, to the new host. A browser's opaque redirect (status 0) is reported the same way.
 - A `baseURL` with no scheme is accepted: `http://` is prepended for a loopback host (`localhost`, `127.0.0.0/8`, `::1`, `*.localhost`), `https://` for any other, and an explicit scheme is never changed, so `localhost:8080` no longer fails as a URL with the scheme `localhost:`. A `baseURL` that is still unusable now throws an error naming what is expected. `wavehouse-sdk-go` resolves the same inputs to the same base. Fixes #24.

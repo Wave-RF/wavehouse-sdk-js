@@ -313,7 +313,9 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
 
   const kind = opts.kind ?? "read";
   let lastError: WaveHouseError | null = null;
-  const maxAttempts = ctx.options.maxRetries + 1;
+  // At least one attempt, so a bad count can never skip the loop.
+  const retries = ctx.options.maxRetries;
+  const maxAttempts = Number.isInteger(retries) && retries > 0 ? retries + 1 : 1;
 
   const timeoutMs = attemptTimeout(opts.attemptTimeoutMs ?? ctx.options.attemptTimeoutMs);
 
@@ -465,7 +467,16 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
     }
   }
 
-  return { data: null, error: lastError!, headers: new Headers() };
+  return {
+    data: null,
+    error: lastError ?? {
+      status: 0,
+      code: "NETWORK_ERROR",
+      message: "No request attempt was made",
+      retryable: false,
+    },
+    headers: new Headers(),
+  };
 }
 
 /**
