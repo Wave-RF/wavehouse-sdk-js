@@ -144,6 +144,13 @@ export interface ClientConfig<_DB extends Database = Database> {
  */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * A function form of `options.headers`: called before every attempt and every
+ * stream connect, for credentials that rotate. It follows the contract of
+ * `auth`: it must be cheap, and caching is the implementer's job.
+ */
+export type HeadersProvider = () => Record<string, string> | Promise<Record<string, string>>;
+
 export interface ClientOptions {
   /** Maximum retry attempts for failed requests. Default: 2. */
   maxRetries?: number;
@@ -212,7 +219,14 @@ export interface ClientOptions {
    * SDK's own headers: `auth` still owns `Authorization`, and the
    * `Content-Type` and `Accept` a given request needs are not overridable
    * here — a global `Content-Type` that outranked the request's own is a
-   * documented way to break uploads.
+   * documented way to break uploads. Precedence, lowest to highest: these
+   * headers, a per-call `headers`, `auth`'s `Authorization`, then the SDK's own;
+   * a later layer replaces a header of the same name and never joins with it.
+   *
+   * May be a function, for credentials that rotate: it is called before every
+   * attempt and every stream connect, under the same contract as `auth` — it
+   * must be cheap, and caching is yours to do. A rejection throws out of a REST
+   * call, and is a retryable `SSE_AUTH_ERROR` on a stream.
    *
    * This is also how a multi-tenant deployment selects its tenant: the SDK has
    * no tenant option, so pass `{ "X-Tenant-ID": "acme" }`, sent unchanged on
@@ -225,12 +239,13 @@ export interface ClientOptions {
    * a proxy in front terminates the preflight — which is the deployment they
    * exist for. Server-side callers never preflight.
    */
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | HeadersProvider;
   /**
    * Extra `RequestInit` fields merged into every request — `credentials` for a
    * cookie-authenticated origin, `mode`, `cache`, `keepalive`, or a
    * runtime-specific extension such as Next.js's `next: { tags }`.
    *
+   * A per-call `fetchOptions` is merged over this, field by field (shallowly).
    * Fields the SDK controls (`method`, `headers`, `body`, `signal`) always
    * win, so this cannot corrupt the request itself. Non-standard fields may
    * need a cast, since `RequestInit` only declares the standard ones.
@@ -509,6 +524,26 @@ export interface CallOptions {
    * `options.attemptTimeoutMs`; `0` switches it off for this call.
    */
   attemptTimeoutMs?: number;
+  /**
+   * Headers for this call, over the client's `options.headers` and under
+   * `auth`'s `Authorization` and the SDK's own `Content-Type` and `Accept`.
+   * Matched case-insensitively; a header here replaces the client's of the same
+   * name and is never joined with it.
+   */
+  headers?: Record<string, string>;
+  /**
+   * `RequestInit` fields for this call, merged over the client's
+   * `options.fetchOptions` — Next.js's `next: { tags }` on one query, say.
+   * The fields the SDK controls (`method`, `headers`, `body`, `signal`) still
+   * win.
+   */
+  fetchOptions?: RequestInit;
+  /**
+   * An implementation of `fetch` for this call alone, over `options.fetch` —
+   * a framework's request-scoped `fetch`, such as SvelteKit's `load()` one. The
+   * contract on {@link FetchLike} applies.
+   */
+  fetch?: FetchLike;
 }
 
 /**
@@ -571,6 +606,12 @@ export interface StreamOptions {
   since?: string;
   signal?: AbortSignal;
   /**
+   * Headers for this subscription's connections, over the client's
+   * `options.headers` and under the SDK's own, with the precedence of
+   * {@link CallOptions.headers}.
+   */
+  headers?: Record<string, string>;
+  /**
    * This subscription's per-attempt deadline for each connect, in milliseconds,
    * over the client's `options.attemptTimeoutMs`; `0` switches it off.
    */
@@ -589,7 +630,7 @@ export interface HttpContext {
     maxRetryAfterMs?: number;
     attemptTimeoutMs?: number;
     fetch?: FetchLike;
-    headers?: Record<string, string>;
+    headers?: Record<string, string> | HeadersProvider;
     fetchOptions?: RequestInit;
   };
 }

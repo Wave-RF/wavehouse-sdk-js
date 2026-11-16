@@ -34,6 +34,7 @@ export type {
   FetchLike,
   // Query
   FilterOp,
+  HeadersProvider,
   InsertPermissions,
   // Ingest
   InsertRecordResult,

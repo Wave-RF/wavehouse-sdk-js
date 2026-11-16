@@ -137,6 +137,7 @@ export class WaveHouseClient<DB extends Database = Database> {
       auth: this._ctx.auth,
       fetch: this._ctx.options.fetch,
       headers: this._ctx.options.headers,
+      callHeaders: opts?.headers,
       attemptTimeoutMs: opts?.attemptTimeoutMs ?? this._ctx.options.attemptTimeoutMs,
       fetchOptions: this._ctx.options.fetchOptions,
     });

@@ -19,6 +19,8 @@ interface WireCase {
   tenant?: string;
   /** Request headers set through `options.headers`. */
   headers?: Record<string, string>;
+  /** The call's own headers, through the per-call `headers` option. */
+  call_headers?: Record<string, string>;
   operations?: { method: string; args?: unknown[] }[];
   pipe_name?: string;
   pipe_params?: Record<string, unknown> | null;
@@ -84,21 +86,22 @@ async function run(tc: WireCase): Promise<Seen[]> {
   const ops = tc.operations ?? [];
   // A per-call tenant is the admin routes' `?tenant=`.
   const opts = tc.tenant === undefined ? undefined : { tenant: tc.tenant };
+  const call = tc.call_headers === undefined ? undefined : { headers: tc.call_headers };
 
   switch (tc.endpoint) {
     case "query":
-      await applyOps(wh.from(tc.table ?? ""), ops).fetch();
+      await applyOps(wh.from(tc.table ?? ""), ops).fetch(call);
       break;
     case "ingest":
-      await wh.from(tc.table ?? "").insert(ops[0].args?.[0] as Record<string, unknown>);
+      await wh.from(tc.table ?? "").insert(ops[0].args?.[0] as Record<string, unknown>, call);
       break;
     case "pipe":
-      await wh.pipe(tc.pipe_name ?? "", tc.pipe_params ?? undefined).fetch();
+      await wh.pipe(tc.pipe_name ?? "", tc.pipe_params ?? undefined).fetch(call);
       break;
     // JS has one raw-SQL call; Go splits it into Fetch and Exec.
     case "sql":
     case "sql_exec":
-      await wh.sql(tc.sql ?? "", opts);
+      await wh.sql(tc.sql ?? "", { ...opts, ...call });
       break;
     case "health":
       await wh.sys.health();

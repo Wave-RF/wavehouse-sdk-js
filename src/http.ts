@@ -1,5 +1,12 @@
 import { networkError, parseErrorResponse } from "./errors.js";
-import type { CallOptions, HttpContext, OpsRequestOptions, WaveHouseError } from "./types.js";
+import type {
+  CallOptions,
+  FetchLike,
+  HeadersProvider,
+  HttpContext,
+  OpsRequestOptions,
+  WaveHouseError,
+} from "./types.js";
 import { resolveURL } from "./url.js";
 
 interface RequestSpec {
@@ -16,8 +23,11 @@ interface RequestSpec {
   contentType?: string;
   params?: Record<string, string>;
   signal?: AbortSignal;
-  /** Per-call override of the client's `attemptTimeoutMs`; see {@link CallOptions}. */
+  /** Per-call overrides of the client's `options`; see {@link CallOptions}. */
   attemptTimeoutMs?: number;
+  headers?: Record<string, string>;
+  fetchOptions?: RequestInit;
+  fetch?: FetchLike;
   /**
    * How safely a call can be sent twice. `read` (the default, and ingest, which
    * dedupes) retries as before. `sql` and `pipe` may run a write, so they are
@@ -72,14 +82,60 @@ export function mergeHeaders(
 }
 
 /**
+ * Layer header sets, lowest first: a later layer replaces an earlier header of
+ * the same name (case-insensitively, keeping the later spelling) and never
+ * joins with it.
+ *
+ * @internal
+ */
+export function overlayHeaders(
+  ...layers: (Record<string, string> | undefined)[]
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const spelled = new Map<string, string>();
+  for (const layer of layers) {
+    if (!layer) continue;
+    for (const [name, value] of Object.entries(layer)) {
+      const lower = name.toLowerCase();
+      const prior = spelled.get(lower);
+      if (prior !== undefined) delete out[prior];
+      out[name] = value;
+      spelled.set(lower, name);
+    }
+  }
+  return out;
+}
+
+/**
+ * The client's `options.headers`, called afresh when it is a function. Run
+ * before every attempt and every stream connect, so a rotated credential is the
+ * one sent; a rejection propagates like a rejecting `auth`.
+ *
+ * @internal
+ */
+export async function resolveClientHeaders(
+  headers: Record<string, string> | HeadersProvider | undefined,
+): Promise<Record<string, string> | undefined> {
+  return typeof headers === "function" ? await headers() : headers;
+}
+
+/**
  * The per-call fields of an options object, for spreading into a `RequestSpec`.
  * Picks fields by name so an options value carrying anything else (`limit`,
  * `tenant`) never leaks into the spec.
  *
  * @internal
  */
-export function callOpts(opts?: CallOptions): Pick<RequestSpec, "signal" | "attemptTimeoutMs"> {
-  return { signal: opts?.signal, attemptTimeoutMs: opts?.attemptTimeoutMs };
+export function callOpts(
+  opts?: CallOptions,
+): Pick<RequestSpec, "signal" | "attemptTimeoutMs" | "headers" | "fetchOptions" | "fetch"> {
+  return {
+    signal: opts?.signal,
+    attemptTimeoutMs: opts?.attemptTimeoutMs,
+    headers: opts?.headers,
+    fetchOptions: opts?.fetchOptions,
+    fetch: opts?.fetch,
+  };
 }
 
 /** A usable per-attempt timeout: a positive finite number of milliseconds. */
@@ -226,12 +282,12 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   const timeoutMs = attemptTimeout(opts.attemptTimeoutMs ?? ctx.options.attemptTimeoutMs);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    // Resolved before every attempt, not once per call: a token that changed
-    // during a backoff is the one a retry sends. Outside the `try` below, so a
-    // rejection throws out of `request` as it always has instead of being
-    // retried as a network error. `auth` is called synchronously on the first
-    // attempt: a liveQuery depends on which of the stream and the backfill
-    // reaches it first.
+    // Resolved before every attempt, not once per call: a token or a rotating
+    // header that changed during a backoff is the one a retry sends. Both run
+    // outside the `try` below, so a rejection throws out of `request` as it
+    // always has instead of being retried as a network error.
+    // `auth` goes first, and is called synchronously on the first attempt: a
+    // liveQuery depends on which of the stream and the backfill reaches it first.
     const sdkHeaders = { ...headers };
     if (ctx.auth) {
       const token = await ctx.auth();
@@ -239,16 +295,20 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         sdkHeaders.Authorization = `Bearer ${token}`;
       }
     }
-    // After auth, so `auth` keeps ownership of Authorization, and after the
-    // Content-Type/Accept this request needs.
-    const finalHeaders = mergeHeaders(sdkHeaders, ctx.options.headers);
+    const clientHeaders = await resolveClientHeaders(ctx.options.headers);
+    // Lowest to highest: client headers, per-call headers, `auth`'s
+    // Authorization, then the SDK's own (the Content-Type and Accept this
+    // request needs). `mergeHeaders` keeps the SDK's names out of the way.
+    const finalHeaders = mergeHeaders(sdkHeaders, overlayHeaders(clientHeaders, opts.headers));
 
     const guard = attemptGuard(opts.signal, timeoutMs);
     try {
-      // Configured RequestInit first, so the fields the SDK controls overwrite
-      // it — a supplied `method` or `body` would otherwise corrupt the request.
+      // Configured RequestInit first, then the call's, so the fields the SDK
+      // controls overwrite both — a supplied `method` or `body` would
+      // otherwise corrupt the request.
       const init: RequestInit = {
         ...ctx.options.fetchOptions,
+        ...opts.fetchOptions,
         method: opts.method,
         headers: finalHeaders,
         body: requestBody,
@@ -257,7 +317,7 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       // Call the global directly when no override is configured, rather than
       // capturing it — a detached `fetch` reference is not universally safe to
       // invoke, and late binding is what lets tests swap `globalThis.fetch`.
-      const doFetch = ctx.options.fetch;
+      const doFetch = opts.fetch ?? ctx.options.fetch;
       const res = await guard.race(doFetch ? doFetch(url, init) : fetch(url, init));
 
       if (res.ok) {

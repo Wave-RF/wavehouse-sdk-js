@@ -1,7 +1,13 @@
 import { createParser } from "eventsource-parser";
 import { parseErrorResponse } from "../errors.js";
-import { attemptTimeout, mergeHeaders } from "../http.js";
-import type { FetchLike, StreamEvent, StreamStatus, WaveHouseError } from "../types.js";
+import { attemptTimeout, mergeHeaders, overlayHeaders, resolveClientHeaders } from "../http.js";
+import type {
+  FetchLike,
+  HeadersProvider,
+  StreamEvent,
+  StreamStatus,
+  WaveHouseError,
+} from "../types.js";
 import { resolveURL } from "../url.js";
 import type { StreamTransport } from "./controller.js";
 
@@ -11,7 +17,10 @@ export interface SSEOptions {
   since?: string;
   auth?: () => Promise<string> | string;
   fetch?: FetchLike;
-  headers?: Record<string, string>;
+  /** The client's `options.headers`; a function is called before every connect. */
+  headers?: Record<string, string> | HeadersProvider;
+  /** Headers for this subscription, over `headers` and under the SDK's own. */
+  callHeaders?: Record<string, string>;
   /** Per-connect deadline up to the response headers; never an established stream. */
   attemptTimeoutMs?: number;
   fetchOptions?: RequestInit;
@@ -535,6 +544,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       }
     }
 
+    // Resolved per attempt like the token: a rotated credential is the one a
+    // reconnect sends. Client headers, then this subscription's, then the SDK's.
+    const custom = overlayHeaders(
+      await resolveClientHeaders(this._opts.headers),
+      this._opts.callHeaders,
+    );
+
     // The server reads the event id as the resume timestamp. Before any event
     // has been delivered there is no id, so `_url` sends `since` instead.
     if (this._lastEventId) base["Last-Event-ID"] = this._lastEventId;
@@ -547,13 +563,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     // from a deployment with no cookies at all.
     const credentialed =
       base.Authorization !== undefined ||
-      Object.keys(this._opts.headers ?? {}).length > 0 ||
+      Object.keys(custom).length > 0 ||
       ("window" in globalThis && this._opts.fetchOptions?.credentials === "include");
 
     const init: RequestInit = {
       ...this._opts.fetchOptions,
       method: "GET",
-      headers: mergeHeaders(base, this._opts.headers),
+      headers: mergeHeaders(base, custom),
       signal,
       // Owned by the SDK rather than left to `fetchOptions`, unlike the REST
       // path, because on a stream these are correctness rather than preference:
