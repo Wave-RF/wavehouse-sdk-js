@@ -192,7 +192,10 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
    *
    * The subscriber's `initial()` is called once with the fetch result, then
    * `next()` fires for each live event. Events that arrived during the fetch
-   * are deduplicated and flushed automatically.
+   * are deduplicated and flushed automatically, against the newest
+   * `received_timestamp` among the fetched rows. A table without that column,
+   * or a `.select()` that drops it, has nothing to deduplicate against: events
+   * that arrived during the fetch may then repeat rows already in `initial()`.
    *
    * Returns a LiveQuery handle with a `.close()` method.
    */

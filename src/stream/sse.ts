@@ -73,12 +73,28 @@ function releaseBody(res: Response): void {
   if (res.body && !res.body.locked) res.body.cancel().catch(() => {});
 }
 
+/**
+ * Milliseconds a `Retry-After` header asks for, clamped to `MAX_BACKOFF_MS` so a
+ * hostile or fat-fingered value can't strand a stream. Both header forms are
+ * read (delta-seconds and an HTTP-date); anything else, or a date already
+ * past, is no request at all.
+ */
+function parseRetryAfter(value: string | null): number | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  const ms = /^\d+$/.test(v) ? Number(v) * 1000 : Date.parse(v) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return Math.min(ms, MAX_BACKOFF_MS);
+}
+
 /** Outcome of one connection attempt, driving the reconnect decision. */
 interface AttemptResult {
   /** Milliseconds the connection stayed readable; 0 if it never opened. */
   liveMs: number;
   /** Stop for good: a bad token or missing table can't be fixed by retrying. */
   terminal: boolean;
+  /** Floor for the wait before the next attempt, from the response's `Retry-After`. */
+  retryAfterMs?: number;
 }
 
 /**
@@ -87,7 +103,7 @@ interface AttemptResult {
  * Replaces `EventSource`, which cannot set request headers — the reason the JWT
  * used to ride in `?token=`, where it crossed every intermediary in the request
  * URI. In exchange for the `Authorization` header this owns what `EventSource`
- * used to provide: framing, reconnect, and `Last-Event-ID` resumption.
+ * used to provide: framing, reconnect, and resumption from the last event id.
  */
 export class SSETransport<T = Record<string, unknown>> implements StreamTransport<T> {
   private _opts: SSEOptions;
@@ -106,7 +122,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   private _started = false;
   private _counted = false;
   /**
-   * Most recent non-empty event id, replayed as `Last-Event-ID` on reconnect.
+   * Most recent non-empty event id, sent as `since` on reconnect.
    *
    * Deliberately ignores empty ids. The server emits a blank `id:` line for
    * passthrough payloads, and per the SSE spec an empty `id` field *clears* the
@@ -226,7 +242,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     let attempt = 0;
 
     while (!this._closed) {
-      const { liveMs, terminal } = await this._attempt();
+      const { liveMs, terminal, retryAfterMs } = await this._attempt();
 
       if (this._closed) return;
       if (terminal) {
@@ -242,7 +258,8 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       if (liveMs >= STABLE_CONNECTION_MS) attempt = 0;
 
       this._emitStatus("reconnecting");
-      await this._sleep(backoff(attempt, this._retryFloorMs));
+      // A `Retry-After` is a floor for this wait only; a `retry:` field persists.
+      await this._sleep(backoff(attempt, Math.max(this._retryFloorMs, retryAfterMs ?? 0)));
       attempt++;
     }
   }
@@ -316,6 +333,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       return { liveMs: 0, terminal: false };
     }
 
+    // A fetch that ignores `init.signal` can resolve after `disconnect()`;
+    // don't open a connection nobody wants.
+    if (this._closed) {
+      releaseBody(res);
+      return { liveMs: 0, terminal: true };
+    }
+
     // Redirects are refused, not followed — see `_init`. Surfaced explicitly
     // because both shapes are otherwise misleading: a browser reports an
     // opaque status-0 response, and Node hands back the raw 3xx.
@@ -343,14 +367,22 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     if (!res.ok) {
       const error = await parseErrorResponse(res);
+      // 429 is a retry-later status from a fronting rate limiter, so a stream
+      // that took one must re-dial rather than stay dead until a reload — unless
+      // the body says otherwise. Every other 4xx stays terminal.
+      if (
+        res.status === 429 &&
+        (error.details as { retryable?: unknown } | undefined)?.retryable !== false
+      ) {
+        error.retryable = true;
+      }
       this._emitError(error);
       // 4xx is terminal: whatever rejected this usually won't be talked round
       // by repeating the request, and native EventSource likewise stops on
-      // non-200. The exception is a 429/408 from a fronting rate limiter, which
-      // is transient even though the stream still ends (#469). Note WaveHouse
-      // doesn't reject here *for authentication* — the endpoint is ungated and
-      // answers a bad token with a reduced view, which is why `auth` is re-read
-      // per attempt (#239 tracks enforcing expiry). The 4xx it raises itself are
+      // non-200. Note WaveHouse doesn't reject here *for authentication* — the
+      // endpoint is ungated and answers a bad token with a reduced view, which
+      // is why `auth` is re-read per attempt (#239 tracks enforcing expiry). The
+      // 4xx it raises itself are
       // a 400 for a missing or empty `table` (internal/api/stream.go) or a
       // malformed `X-Tenant-ID`, and a 404 `unknown tenant` for a tenant it does
       // not serve (internal/api/tenant.go) — never held, or removed, which is
@@ -358,7 +390,12 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       // rejected tenant's 503 is retried like any 5xx. Any other 404/405 means
       // the request missed the route entirely (router.go's chi handlers), and
       // anything else comes from something in front — a gateway, or a proxy.
-      return { liveMs: 0, terminal: !error.retryable };
+      const retry = error.retryable;
+      return {
+        liveMs: 0,
+        terminal: !retry,
+        retryAfterMs: retry ? parseRetryAfter(res.headers.get("Retry-After")) : undefined,
+      };
     }
 
     // A 200 that isn't an event stream is an intermediary answering for the
@@ -408,8 +445,12 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     this._emitStatus("live");
     const openedAt = Date.now();
-    await this._pump(body);
-    return { liveMs: Date.now() - openedAt, terminal: false };
+    const overflowed = await this._pump(body);
+    // An overflow ends a connection that was readable but not healthy: counting
+    // it as held would reset the backoff each cycle, and a peer that overflows
+    // every time (a broken intermediary) would be re-dialed at a flat rate,
+    // pulling the whole buffer cap on every pass.
+    return { liveMs: overflowed ? 0 : Date.now() - openedAt, terminal: false };
   }
 
   /** Resolve the stream URL. Throws on a `baseURL` that isn't a usable http(s) origin. */
@@ -425,7 +466,10 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       );
     }
     url.searchParams.set("table", this._opts.table);
-    const since = this._opts.since || this._resumeSince;
+    // The last event id is the server's own `received_timestamp`, which is what
+    // `since` takes, so it outranks the caller's initial window and the
+    // connection-start fallback once there is something to resume from.
+    const since = this._lastEventId || this._opts.since || this._resumeSince;
     if (since) {
       url.searchParams.set("since", since);
     }
@@ -446,16 +490,22 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       }
     }
 
-    // Takes precedence over `since` server-side, so the initial window stays on
-    // the URL and resumption rides the header once there's something to resume.
-    if (this._lastEventId) {
-      base["Last-Event-ID"] = this._lastEventId;
-    }
+    // Resumption rides the `since` query parameter (see `_url`), not a
+    // `Last-Event-ID` header: that header is not CORS-safelisted, so on a
+    // cross-origin reconnect it forces a preflight a fronting proxy may reject,
+    // and every later attempt would then fail the same way forever (#26). The
+    // server reads an event id and `since` as the same timestamp.
 
     // Anything a redirect target must not be handed: the bearer token, or the
     // configured headers that carry proxy service-token secrets.
+    // An explicit `credentials: "include"` is the documented opt-in to cookie
+    // auth, so it counts too — in a browser only, the one place it is honored.
+    // The implicit `same-origin` default stays invisible: it cannot be told
+    // from a deployment with no cookies at all.
     const credentialed =
-      base.Authorization !== undefined || Object.keys(this._opts.headers ?? {}).length > 0;
+      base.Authorization !== undefined ||
+      Object.keys(this._opts.headers ?? {}).length > 0 ||
+      ("window" in globalThis && this._opts.fetchOptions?.credentials === "include");
 
     const init: RequestInit = {
       ...this._opts.fetchOptions,
@@ -478,12 +528,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       //              convenience. Without either, redirects are followed, so CDN
       //              canonicalization, geo/LB indirection, and an http→https
       //              upgrade all just work. The test is deliberately that
-      //              concrete pair and not "is this authenticated": cookies do
-      //              not appear in it. A cookie is re-derived per
-      //              destination rather than carried, so under the default
-      //              same-origin credentials mode it survives a redirect only
-      //              while the hop stays inside both the request's origin and
-      //              the cookie's Path; outside either the stream is
+      //              concrete set and not "is this authenticated": an explicit
+      //              `credentials: "include"` is in it, but cookies relied on
+      //              through the implicit same-origin default are not. A cookie
+      //              is re-derived per destination rather than carried, so under
+      //              the default same-origin credentials mode it survives a
+      //              redirect only while the hop stays inside both the request's
+      //              origin and the cookie's Path; outside either the stream is
       //              silently unauthed. See #478 and the SDK guide under
       //              "Supplying your own fetch".
       //              `manual` over `error` for the credentialed case so the
@@ -511,7 +562,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   }
 
   /** Decode and parse frames until the stream ends, aborts, or errors. */
-  private async _pump(body: ReadableStream<Uint8Array>): Promise<void> {
+  private async _pump(body: ReadableStream<Uint8Array>): Promise<boolean> {
     // Set when the parser reports a buffer overflow: it is terminated at that
     // point, so the read loop must stop rather than feed it again.
     let overflowed = false;
@@ -548,20 +599,21 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) return;
+        if (done) return false;
         parser.feed(decoder.decode(value, { stream: true }));
         // End the connection on the overflow we just reported, instead of
         // feeding a terminated parser and re-reporting it as a read failure.
-        if (overflowed) return;
+        if (overflowed) return true;
       }
     } catch (e) {
-      if (this._closed) return;
+      if (this._closed) return overflowed;
       this._emitError({
         status: 0,
         code: "SSE_READ_ERROR",
         message: e instanceof Error ? e.message : String(e),
         retryable: true,
       });
+      return overflowed;
     } finally {
       reader.cancel().catch(() => {
         // Already torn down — nothing left to release.

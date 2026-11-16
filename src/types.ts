@@ -111,6 +111,11 @@ export interface ClientConfig<_DB extends Database = Database> {
  * other than a `DOMException` named `AbortError` — `AbortSignal.timeout()`,
  * `node-fetch` — is reported the same way.
  *
+ * **Honor `init.signal`.** The SDK aborts it to cancel a call or close a stream,
+ * and relies on the rejection or errored body that follows. An implementation
+ * that ignores the signal keeps a request (and, for a stream, a socket) running
+ * after the caller has let go of it.
+ *
  * **Streaming needs more.** `.stream()` and `.liveQuery()` read the response as
  * it arrives, via `.body.getReader()`, so an implementation used with them must
  * return a response carrying a live `ReadableStream` — something the type cannot
@@ -202,15 +207,17 @@ export interface ClientOptions {
    * would fail cross-origin preflight, and following a redirect would strip the
    * `Authorization` header on a cross-origin hop and silently downgrade the
    * stream to the default role instead of failing. So a request carrying an
-   * `auth` token, or configured `headers` that may hold a proxy secret, refuses
-   * redirects (`SSE_REDIRECT`); without either it follows them, so CDN
-   * canonicalization and an http→https upgrade still work. Note the test is
-   * that concrete pair, not "is this authenticated" — **cookies are invisible
-   * to it**. A cookie is re-derived from the cookie store at each hop rather
-   * than carried, so under the default `same-origin` credentials mode a
-   * redirect keeps the stream authenticated only while the hop stays inside
-   * both the request's origin and the cookie's `Path`; a hop outside either
-   * arrives with no cookie and gets a `default_role` view rather than an error.
+   * `auth` token, configured `headers` that may hold a proxy secret, or (in a
+   * browser) `credentials: "include"` refuses redirects (`SSE_REDIRECT`);
+   * without any of them it follows them, so CDN canonicalization and an
+   * http→https upgrade still work. Cookies relied on through the implicit
+   * `same-origin` default are **invisible to that test**, since that default
+   * cannot be told from a deployment with no cookies. A cookie is re-derived
+   * from the cookie store at each hop rather than carried, so under the default
+   * `same-origin` credentials mode a redirect keeps the stream authenticated
+   * only while the hop stays inside both the request's origin and the cookie's
+   * `Path`; a hop outside either arrives with no cookie and gets a
+   * `default_role` view rather than an error.
    * With `credentials: "include"` the origin half is replaced rather than
    * lifted: ordinary cookie scoping decides, so the cookie crosses a
    * CORS-allowed cross-origin hop only if its own `Domain` covers the target —

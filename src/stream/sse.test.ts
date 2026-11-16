@@ -176,6 +176,51 @@ describe("SSETransport request construction", () => {
     t.disconnect();
   });
 
+  describe("redirect policy by credential", () => {
+    const cases: Array<{
+      name: string;
+      opts: Record<string, unknown>;
+      browser: boolean;
+      redirect: string;
+    }> = [
+      { name: "nothing", opts: {}, browser: true, redirect: "follow" },
+      { name: "a bearer token", opts: { auth: () => "t" }, browser: false, redirect: "manual" },
+      {
+        name: "configured headers",
+        opts: { headers: { "X-Key": "k" } },
+        browser: false,
+        redirect: "manual",
+      },
+      {
+        name: "credentials include in a browser",
+        opts: { fetchOptions: { credentials: "include" } },
+        browser: true,
+        redirect: "manual",
+      },
+      {
+        name: "credentials include outside a browser",
+        opts: { fetchOptions: { credentials: "include" } },
+        browser: false,
+        redirect: "follow",
+      },
+      {
+        name: "credentials same-origin in a browser",
+        opts: { fetchOptions: { credentials: "same-origin" } },
+        browser: true,
+        redirect: "follow",
+      },
+    ];
+    it.each(cases)("$name -> $redirect", async ({ opts, browser, redirect }) => {
+      if (browser) vi.stubGlobal("window", {});
+      const f = makeFetch();
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl, ...opts });
+      t.connect();
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+      expect(f.attempts[0].init.redirect).toBe(redirect);
+      t.disconnect();
+    });
+  });
+
   it("neutralizes a body from fetchOptions", async () => {
     const f = makeFetch();
     const t = new SSETransport({
@@ -597,7 +642,8 @@ describe("SSETransport reconnect and resumption", () => {
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
 
-    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:03Z");
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:03Z");
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
     expect(headersOf(f.attempts[1]).Authorization).toBe("Bearer token-2");
     expect(seen.statuses).toContain("reconnecting");
 
@@ -746,6 +792,52 @@ describe("SSETransport reconnect and resumption", () => {
     t.disconnect();
   });
 
+  it("backs off across repeated overflows even when each connection ran past the stable window", async () => {
+    const f = makeFetch();
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const third = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+      () => third.res,
+    );
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+
+    // Held long enough to count as healthy, then overflows: the first wait is
+    // the schedule's first step (500-1000ms)...
+    await vi.advanceTimersByTimeAsync(4000);
+    first.push(`data: ${"x".repeat(MAX_BUFFER_CHARS)}`);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.attempts).toHaveLength(2);
+
+    // ...and the second must not start over: it is the next step (1000-2000ms).
+    await vi.advanceTimersByTimeAsync(4000);
+    second.push(`data: ${"x".repeat(MAX_BUFFER_CHARS)}`);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(f.attempts).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(f.attempts).toHaveLength(3);
+    t.disconnect();
+  });
+
+  it("does not open a connection when disconnect() lands while a signal-ignoring fetch resolves", async () => {
+    let release!: (r: Response) => void;
+    const body = streamingResponse();
+    const impl: FetchLike = () => new Promise<Response>((r) => (release = r));
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    t.disconnect();
+    release(body.res);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(seen.statuses).toEqual(["closed"]);
+  });
+
   it("retries an AbortError from a custom fetch that the SDK did not raise", async () => {
     const f = makeFetch();
     // The motivating case: an `options.fetch` enforcing its own per-attempt
@@ -824,7 +916,8 @@ describe("SSETransport reconnect and resumption", () => {
 
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
-    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:09Z");
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
 
     t.disconnect();
   });
@@ -860,6 +953,146 @@ describe("SSETransport reconnect and resumption", () => {
     await vi.waitFor(() => expect(f.attempts.length).toBeGreaterThan(1));
 
     t.disconnect();
+  });
+
+  it("reconnects through a proxy whose CORS preflight rejects Last-Event-ID", async () => {
+    // A cross-origin fetch carrying a non-safelisted header preflights; model a
+    // proxy that answers the preflight without allowing it as a rejected fetch.
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const urls: string[] = [];
+    let call = 0;
+    const impl: FetchLike = async (url, init) => {
+      urls.push(url);
+      if ("Last-Event-ID" in ((init?.headers ?? {}) as Record<string, string>)) {
+        throw new TypeError("CORS preflight failed");
+      }
+      return call++ === 0 ? first.res : second.res;
+    };
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(urls).toHaveLength(1));
+    first.push(rowFrames("2026-08-01T00:00:09Z", "2026-08-01T00:00:09Z", { n: 1 }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(urls).toHaveLength(2));
+    second.push(rowFrames("2026-08-01T00:00:10Z", "2026-08-01T00:00:10Z", { n: 2 }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+    expect(seen.errors).toEqual([]);
+    t.disconnect();
+  });
+
+  describe("429 and Retry-After", () => {
+    /** Run one rejected attempt and return how many attempts exist after `ms`. */
+    async function attemptsAfter(res: () => Response, waits: number[]) {
+      const f = makeFetch();
+      f.queue.push(res);
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      // `waitFor` above already advanced the fake clock a little, so every
+      // boundary below keeps a second's margin either side of the deadline.
+      const counts: number[] = [];
+      const statuses = [...seen.statuses];
+      for (const w of waits) {
+        await vi.advanceTimersByTimeAsync(w);
+        counts.push(f.attempts.length);
+      }
+      statuses.push(...seen.statuses.slice(statuses.length));
+      t.disconnect();
+      return { counts, seen: { ...seen, statuses } };
+    }
+
+    it("retries a 429 instead of ending the stream", async () => {
+      const { counts, seen } = await attemptsAfter(
+        () => new Response("{}", { status: 429 }),
+        [2000],
+      );
+      expect(seen.errors[0].status).toBe(429);
+      expect(seen.errors[0].retryable).toBe(true);
+      expect(seen.statuses).not.toContain("closed");
+      expect(counts[0]).toBe(2);
+    });
+
+    it("keeps a 429 terminal when the body says it is not retryable", async () => {
+      const { counts, seen } = await attemptsAfter(
+        () => new Response(JSON.stringify({ retryable: false }), { status: 429 }),
+        [60_000],
+      );
+      expect(seen.errors[0].retryable).toBe(false);
+      expect(counts[0]).toBe(1);
+    });
+
+    it.each([400, 401, 403, 404, 405, 408, 410, 413])("keeps a %i terminal", async (status) => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status, headers: { "Retry-After": "1" } }),
+        [60_000],
+      );
+      expect(counts[0]).toBe(1);
+    });
+
+    it("waits Retry-After seconds before re-dialing a 429", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": "20" } }),
+        [19_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("waits Retry-After on a 503 too", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 503, headers: { "Retry-After": "12" } }),
+        [11_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("reads Retry-After as an HTTP-date", async () => {
+      vi.setSystemTime(new Date("2026-08-01T00:00:00.000Z"));
+      const { counts } = await attemptsAfter(
+        () =>
+          new Response("{}", {
+            status: 429,
+            headers: { "Retry-After": new Date("2026-08-01T00:00:15Z").toUTCString() },
+          }),
+        [14_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("clamps an enormous Retry-After to the 30s ceiling", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": "86400" } }),
+        [29_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it.each(["soon", "-5", "0", ""])("ignores an unusable Retry-After %j", async (value) => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": value } }),
+        [1000, 1000],
+      );
+      expect(counts[1]).toBe(2);
+    });
+
+    it("applies Retry-After to one wait only", async () => {
+      const f = makeFetch();
+      f.queue.push(() => new Response("{}", { status: 429, headers: { "Retry-After": "20" } }));
+      f.queue.push(() => new Response("{}", { status: 429 }));
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      collect(t);
+      t.connect();
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      // The second wait is the schedule's own (attempt 1: at most 2s), not 20s.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.attempts).toHaveLength(3);
+      t.disconnect();
+    });
   });
 
   it("retries when the connection itself fails", async () => {
@@ -1457,7 +1690,7 @@ describe("SSETransport early reconnect", () => {
     t.disconnect();
   });
 
-  it("keeps the caller's since, and prefers Last-Event-ID once an event arrived", async () => {
+  it("keeps the caller's since, and resumes from the last event id once one arrived", async () => {
     const f = makeFetch();
     const first = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
     f.queue.push(() => first.res);
@@ -1489,7 +1722,8 @@ describe("SSETransport early reconnect", () => {
     one.close();
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(g.attempts).toHaveLength(2));
-    expect(headersOf(g.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
+    expect(new URL(g.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:09Z");
+    expect(headersOf(g.attempts[1])["Last-Event-ID"]).toBeUndefined();
     t2.disconnect();
   });
 });

@@ -116,8 +116,6 @@ describe("SchemaNamespace", () => {
 });
 
 describe("DLQNamespace", () => {
-  const mockStream = vi.fn();
-
   beforeEach(() => {
     fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
@@ -129,7 +127,7 @@ describe("DLQNamespace", () => {
     const stats = { tables: { clicks: 5 }, total: 5 };
     fetchSpy.mockResolvedValue(new Response(JSON.stringify(stats), { status: 200 }));
 
-    const ns = new DLQNamespace(makeCtx(), mockStream);
+    const ns = new DLQNamespace(makeCtx());
     const result = await ns.list();
 
     expect(result.data).toEqual(stats);
@@ -140,7 +138,7 @@ describe("DLQNamespace", () => {
       new Response(JSON.stringify({ tables: { clicks: 3 }, total: 3 }), { status: 200 }),
     );
 
-    const ns = new DLQNamespace(makeCtx(), mockStream);
+    const ns = new DLQNamespace(makeCtx());
     await ns.table("clicks");
 
     expect(fetchSpy.mock.calls[0][0]).toContain("table=clicks");
@@ -150,7 +148,7 @@ describe("DLQNamespace", () => {
     fetchSpy.mockImplementation(
       async () => new Response(JSON.stringify({ tables: {}, total: 0 }), { status: 200 }),
     );
-    const ns = new DLQNamespace(makeCtx(), mockStream);
+    const ns = new DLQNamespace(makeCtx());
 
     await ns.list({ tenant: "acme" });
     await ns.table("clicks", { tenant: "acme" });
@@ -165,13 +163,8 @@ describe("DLQNamespace", () => {
     expect(urls[3].search).toBe("?table=clicks");
   });
 
-  it("stream() delegates to createStream", () => {
-    const ctrl = {} as any;
-    mockStream.mockReturnValue(ctrl);
-
-    const ns = new DLQNamespace(makeCtx(), mockStream);
-    expect(ns.stream()).toBe(ctrl);
-    expect(mockStream).toHaveBeenCalledWith("dlq", undefined);
+  it("has no stream() — the server has no dead-letter stream", () => {
+    expect((new DLQNamespace(makeCtx()) as unknown as { stream?: unknown }).stream).toBeUndefined();
   });
 });
 
