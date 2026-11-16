@@ -29,9 +29,7 @@ export class StreamController<T = Record<string, unknown>> {
     this._transport = transport;
 
     this._transport.onEvent = (event) => {
-      for (const sub of this._subscribers) {
-        sub.next(event);
-      }
+      this._fanOut("next", (sub) => sub.next(event));
       // Async iterator support
       const waiter = this._waiters.shift();
       if (waiter) {
@@ -50,25 +48,41 @@ export class StreamController<T = Record<string, unknown>> {
       // 'connecting' after StreamController already set it as the initial state).
       if (status === this._status) return;
       this._status = status;
-      for (const sub of this._subscribers) {
-        sub.status?.(status);
-      }
-      if (status === "closed") {
-        this._done = true;
-        for (const w of this._waiters) {
-          w.resolve({ value: undefined as never, done: true });
-        }
-        this._waiters = [];
-      }
+      // Iterator termination first, so no subscriber can keep a `for await` open.
+      if (status === "closed") this._finish();
+      this._fanOut("status", (sub) => sub.status?.(status));
     };
 
     this._transport.onError = (error) => {
-      for (const sub of this._subscribers) {
-        sub.error?.(error);
-      }
+      this._fanOut("error", (sub) => sub.error?.(error));
     };
 
     this._transport.connect();
+  }
+
+  /**
+   * Deliver to every subscriber, each isolated: a throwing callback costs only
+   * its own delivery, not the subscribers after it or the iterator bookkeeping.
+   */
+  private _fanOut(what: string, call: (sub: StreamSubscriber<T>) => void): void {
+    for (const sub of [...this._subscribers]) {
+      // A callback earlier in this pass may have unsubscribed a later one.
+      if (!this._subscribers.has(sub)) continue;
+      try {
+        call(sub);
+      } catch (e) {
+        console.error(`[wavehouse] subscriber ${what} handler threw:`, e);
+      }
+    }
+  }
+
+  /** End every pending and future `for await` once its buffer is drained. */
+  private _finish(): void {
+    this._done = true;
+    for (const w of this._waiters) {
+      w.resolve({ value: undefined as never, done: true });
+    }
+    this._waiters = [];
   }
 
   /** Current connection status. */
@@ -141,7 +155,13 @@ export class StreamController<T = Record<string, unknown>> {
       // iterator was started; drop them rather than hold them forever.
       if (!this._iterated) this._buffer = [];
     }
-    subscriber.status?.(this._status);
+    // Guarded: a throw here would escape `subscribe()` (and `liveQuery()`,
+    // which would then return no handle while its stream keeps running).
+    try {
+      subscriber.status?.(this._status);
+    } catch (e) {
+      console.error("[wavehouse] subscriber status handler threw:", e);
+    }
 
     return () => {
       this._subscribers.delete(subscriber);
@@ -163,17 +183,11 @@ export class StreamController<T = Record<string, unknown>> {
   /** Close the stream and release resources. */
   close(): void {
     this._transport.disconnect();
+    this._finish();
     if (this._status !== "closed") {
       this._status = "closed";
-      for (const sub of this._subscribers) {
-        sub.status?.("closed");
-      }
+      this._fanOut("status", (sub) => sub.status?.("closed"));
     }
-    this._done = true;
-    for (const w of this._waiters) {
-      w.resolve({ value: undefined as never, done: true });
-    }
-    this._waiters = [];
     // Nothing reads the queue of a callback-only stream; an iterator may still drain it.
     if (this._subscribed && !this._iterated) this._buffer = [];
   }

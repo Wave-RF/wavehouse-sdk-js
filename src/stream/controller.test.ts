@@ -303,4 +303,71 @@ describe("StreamController", () => {
       expect(seen).toEqual([event1]);
     });
   });
+
+  describe("a throwing subscriber", () => {
+    const boom = () => {
+      throw new Error("boom");
+    };
+
+    it("does not stop delivery to later subscribers on next, status or error", () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      ctrl.subscribe({ next: boom, status: boom, error: boom });
+      const next = vi.fn();
+      const status = vi.fn();
+      const error = vi.fn();
+      ctrl.subscribe({ next, status, error });
+      status.mockClear();
+
+      t.fireEvent(event1);
+      t.fireStatus("live");
+      const err: WaveHouseError = { status: 0, code: "X", message: "m", retryable: true };
+      t.fireError(err);
+
+      expect(next).toHaveBeenCalledWith(event1);
+      expect(status).toHaveBeenCalledWith("live");
+      expect(error).toHaveBeenCalledWith(err);
+    });
+
+    it("still hands the event to a concurrent for-await", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      const pending = ctrl[Symbol.asyncIterator]().next();
+      ctrl.subscribe({ next: boom });
+      t.fireEvent(event1);
+      expect((await pending).value).toEqual(event1);
+    });
+
+    it("still ends a for-await on the closed status when a status handler throws", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      ctrl.subscribe({ next: () => {}, status: boom });
+      const pending = ctrl[Symbol.asyncIterator]().next();
+      t.fireStatus("closed");
+      expect((await pending).done).toBe(true);
+    });
+
+    it("does not escape subscribe() when the initial status call throws", () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const ctrl = new StreamController(makeTransport());
+      let unsub: (() => void) | undefined;
+      expect(() => {
+        unsub = ctrl.subscribe({ next: () => {}, status: boom });
+      }).not.toThrow();
+      expect(typeof unsub).toBe("function");
+    });
+
+    it("lets the status handler throw before connected() without breaking it", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      ctrl.subscribe({ next: () => {}, status: boom });
+      const p = ctrl.connected();
+      t.fireStatus("live");
+      await expect(p).resolves.toBeUndefined();
+    });
+  });
 });

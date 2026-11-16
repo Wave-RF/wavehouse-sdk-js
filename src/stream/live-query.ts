@@ -47,47 +47,56 @@ export class LiveQuery<T = Record<string, unknown>> {
   }
 
   private async _runBackfill(fetchFn: () => Promise<Result<T[]>>): Promise<void> {
+    let result: Result<T[]> | undefined;
     try {
-      const result = await fetchFn();
+      result = await fetchFn();
+    } catch {
+      // The fetch itself rejected (a failing `auth`, a bad `baseURL`). The
+      // buffered live events are still valid, so deliver them without a boundary.
+    }
 
-      if (this._closed) return;
+    if (this._closed) return;
 
-      // Step 3: Call initial() with the historical snapshot.
-      this._subscriber.initial?.(result);
-
-      if (result.error) {
-        this._buffering = false;
-        return;
+    // Step 3: Call initial() with the historical snapshot.
+    if (result) {
+      try {
+        this._subscriber.initial?.(result);
+      } catch (e) {
+        console.error("[wavehouse] liveQuery initial handler threw:", e);
       }
+    }
 
-      // Step 4: Deduplicate buffered events against fetched rows.
-      // The boundary is the `received_timestamp` of the *last row returned* —
-      // not the newest, unless the query happens to order ascending. The ways
-      // that misbehaves (and there are three) are enumerated once, in the SDK
-      // docs under Live Queries → How it works; #449 tracks the fix. Stated
-      // there rather than restated here, because this claim has already drifted
-      // out of sync three times across the docs and this comment.
+    // Step 4: Deduplicate buffered events against fetched rows. The boundary is
+    // the `received_timestamp` of the *last row returned* — not the newest,
+    // unless the query happens to order ascending. The ways that misbehaves
+    // (and there are three) are enumerated once, in the SDK docs under Live
+    // Queries → How it works; #449 tracks the fix. Stated there rather than
+    // restated here, because this claim has already drifted out of sync three
+    // times across the docs and this comment.
+    let lastTimestamp: string | undefined;
+    if (result && !result.error) {
       const rows = result.data;
-      let lastTimestamp: string | undefined;
       if (rows.length > 0) {
         const lastRow = rows[rows.length - 1] as Record<string, unknown>;
         lastTimestamp = lastRow?.received_timestamp as string | undefined;
       }
+    }
 
-      // Step 5: Flush buffered events newer than that boundary.
-      this._buffering = false;
-      for (const event of this._buffer) {
-        if (this._closed) break;
-        if (lastTimestamp && event.timestamp <= lastTimestamp) {
-          continue; // already covered by the fetch
-        }
-        this._subscriber.next(event);
+    // Step 5: Flush buffered events newer than that boundary. A failed fetch has
+    // no boundary, so every buffered event is delivered.
+    this._buffering = false;
+    const buffered = this._buffer;
+    this._buffer = [];
+    for (const event of buffered) {
+      if (this._closed) break;
+      if (lastTimestamp && event.timestamp <= lastTimestamp) {
+        continue; // already covered by the fetch
       }
-      this._buffer = [];
-    } catch {
-      // Fetch failed — stop buffering and resume live only.
-      this._buffering = false;
-      this._buffer = [];
+      try {
+        this._subscriber.next(event);
+      } catch (e) {
+        console.error("[wavehouse] liveQuery next handler threw:", e);
+      }
     }
   }
 

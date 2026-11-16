@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../client.js";
 import type { FetchLike, Result, StreamEvent, StreamStatus } from "../types.js";
+import type { StreamTransport } from "./controller.js";
+import { StreamController } from "./controller.js";
+import { LiveQuery } from "./live-query.js";
 
 /**
  * `liveQuery()` opens the stream and runs the REST backfill in the same tick,
@@ -116,5 +119,103 @@ describe("liveQuery auth ordering", () => {
     expect(f.urls).toHaveLength(0);
 
     lq.close();
+  });
+});
+
+/** A StreamController over a transport the test drives by hand. */
+function manualStream() {
+  const t: StreamTransport & { fire(e: StreamEvent): void } = {
+    connect: () => {},
+    disconnect: () => {},
+    onEvent: null,
+    onStatus: null,
+    onError: null,
+    fire(e) {
+      this.onEvent?.(e);
+    },
+  };
+  return { t, stream: new StreamController(t) };
+}
+
+const ev = (ts: string, n: number): StreamEvent => ({
+  table: "t",
+  timestamp: ts,
+  data: { n },
+});
+
+describe("liveQuery backfill isolation", () => {
+  it("keeps flushing buffered events when next() throws on one", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { t, stream } = manualStream();
+    const seen: number[] = [];
+    let release!: (r: Result<Record<string, unknown>[]>) => void;
+    const fetchFn = () => new Promise<Result<Record<string, unknown>[]>>((r) => (release = r));
+    new LiveQuery(
+      stream,
+      fetchFn,
+      {
+        next: (e) => {
+          seen.push(e.data.n as number);
+          if (e.data.n === 1) throw new Error("boom");
+        },
+      },
+      [],
+    );
+    t.fire(ev("2026-01-01T00:00:01Z", 1));
+    t.fire(ev("2026-01-01T00:00:02Z", 2));
+    release({ ok: true, data: [], error: null } as Result<Record<string, unknown>[]>);
+    await vi.waitFor(() => expect(seen).toEqual([1, 2]));
+  });
+
+  it("keeps flushing when initial() throws", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { t, stream } = manualStream();
+    const seen: number[] = [];
+    new LiveQuery(
+      stream,
+      async () => ({ ok: true, data: [], error: null }) as Result<Record<string, unknown>[]>,
+      {
+        initial: () => {
+          throw new Error("boom");
+        },
+        next: (e) => seen.push(e.data.n as number),
+      },
+      [],
+    );
+    t.fire(ev("2026-01-01T00:00:01Z", 1));
+    await vi.waitFor(() => expect(seen).toEqual([1]));
+  });
+
+  it("delivers buffered events when the fetch returns an error result", async () => {
+    const { t, stream } = manualStream();
+    const seen: number[] = [];
+    const initial = vi.fn();
+    new LiveQuery(
+      stream,
+      async () =>
+        ({
+          ok: false,
+          data: null,
+          error: { status: 500, code: "X", message: "m", retryable: false },
+        }) as unknown as Result<Record<string, unknown>[]>,
+      { initial, next: (e) => seen.push(e.data.n as number) },
+      [],
+    );
+    t.fire(ev("2026-01-01T00:00:01Z", 1));
+    await vi.waitFor(() => expect(seen).toEqual([1]));
+    expect(initial).toHaveBeenCalledOnce();
+  });
+
+  it("delivers buffered events when the fetch rejects", async () => {
+    const { t, stream } = manualStream();
+    const seen: number[] = [];
+    new LiveQuery(
+      stream,
+      () => Promise.reject(new Error("auth down")),
+      { next: (e) => seen.push(e.data.n as number) },
+      [],
+    );
+    t.fire(ev("2026-01-01T00:00:01Z", 1));
+    await vi.waitFor(() => expect(seen).toEqual([1]));
   });
 });
