@@ -132,5 +132,14 @@ describe("resend safety by call kind", () => {
       const { calls } = await run("read", () => json(400, {}), ok);
       expect(calls).toBe(1);
     });
+    it("resends a 429, which is retryable", async () => {
+      const { calls } = await run("read", () => json(429, {}, { "Retry-After": "1" }), ok);
+      expect(calls).toBe(2);
+    });
+    it("does not resend a 429 the server marks retryable:false", async () => {
+      const { result, calls } = await run("read", () => json(429, { retryable: false }), ok);
+      expect(calls).toBe(1);
+      expect(result.error?.retryable).toBe(false);
+    });
   });
 });

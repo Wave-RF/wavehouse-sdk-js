@@ -121,4 +121,33 @@ describe("Retry-After in request()", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(result.error?.status).toBe(429);
   });
+
+  it("honors Retry-After on a read's 429 and caps it", async () => {
+    const answer429 = (retryAfter: string) => () =>
+      new Response("{}", { status: 429, headers: { "Retry-After": retryAfter } });
+    fetchSpy
+      .mockImplementationOnce(async () => answer429("5")())
+      .mockImplementationOnce(async () => ok());
+    const p = request(ctx(), { method: "GET", path: "/x" });
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((await p).error).toBeNull();
+
+    fetchSpy.mockReset();
+    fetchSpy.mockImplementation(async () => answer429("3600")());
+    const refused = await request(ctx(), { method: "GET", path: "/x" });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(refused.error?.status).toBe(429);
+  });
+
+  it("never resends raw SQL after a 429", async () => {
+    fetchSpy.mockImplementation(
+      async () => new Response("{}", { status: 429, headers: { "Retry-After": "1" } }),
+    );
+    const result = await request(ctx(), { method: "POST", path: "/x", body: {}, kind: "sql" });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result.error?.status).toBe(429);
+  });
 });

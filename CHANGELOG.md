@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- A `429 Too Many Requests` is now retryable on REST reads and ingest (unless the body says `retryable: false`): the SDK waits the `Retry-After` it carries, capped by `maxRetryAfterMs` (30 s by default), then resends, and a 429 that is returned reports `retryable: true`. Raw SQL is still never resent. Fixes #40 and the REST half of #43.
 - A bodyless request (every `GET`, such as `schema.get()` or `pipes.list()`) no longer sends `Content-Type`. `application/json` is not a CORS-safelisted value, so each cross-origin browser read cost a preflight. Requests with a body are unchanged. Fixes #27.
 - `Retry-After` is read as seconds or an HTTP-date; `0` retries at once instead of waiting 30 s; an unreadable value backs off normally. A wait over the new `options.maxRetryAfterMs` (default 30000) is not slept: the call returns the server's 503, or a pipe call's 429, as its error. Fixes #5.
 - `selectAll()` combined with `select()` columns or an aggregation, in either order, now resolves to an `INVALID_QUERY` error without sending a request, instead of reaching the server and failing with a 400. Fixes #31.

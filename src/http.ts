@@ -203,9 +203,9 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       }
 
       // The server's own wait, from Retry-After, for the answers that carry one:
-      // 429 on a call that may have run (`pipe`; a read keeps its behaviour,
-      // where only 5xx and a server `retryable` resend) and any 503.
-      const mayWait = (kind === "pipe" && res.status === 429) || res.status === 503;
+      // a 429 the server has not marked `retryable: false`, and any 503. A raw
+      // SQL statement never gets here (see `mayResendResponse`).
+      const mayWait = (res.status === 429 && error.retryable) || res.status === 503;
       const retryAfter = res.headers.get("Retry-After");
       if (mayWait && (res.status === 429 || retryAfter) && attempt < maxAttempts - 1) {
         const wait = parseRetryAfter(retryAfter, Date.now());
