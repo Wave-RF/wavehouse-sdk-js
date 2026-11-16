@@ -81,15 +81,24 @@ describe("QueryBuilder", () => {
       ["<=", "lte"],
       ["in", "in"],
       ["like", "like"],
-      ["not_like", "not_like"],
     ] as const;
 
+    // The operators the server's filter builder implements; it answers any
+    // other with "unsupported operator", which is a 400 at runtime.
+    const serverOps = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "like", "in"]);
+
     for (const [sdkOp, backendOp] of ops) {
+      expect(serverOps.has(backendOp)).toBe(true);
       fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
       await builder().where("col", sdkOp, "v").fetch();
       const body = JSON.parse(fetchSpy.mock.calls.at(-1)![1].body);
       expect(body.filters[0].op).toBe(backendOp);
     }
+  });
+
+  it("does not offer not_like, which the server rejects on queries", () => {
+    // @ts-expect-error not_like is not a FilterOp
+    builder().where("col", "not_like", "%x%");
   });
 
   it("accumulates multiple where clauses", async () => {

@@ -27,7 +27,6 @@ const OP_MAP: Record<FilterOp, string> = {
   "<=": "lte",
   in: "in",
   like: "like",
-  not_like: "not_like",
 };
 
 interface QueryState {
@@ -339,12 +338,6 @@ function evaluateFilter(actual: unknown, op: string, expected: unknown): boolean
       const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = escaped.replace(/%/g, ".*").replace(/_/g, ".");
       return new RegExp(`^${pattern}$`, "i").test(actual);
-    }
-    case "not_like": {
-      if (typeof actual !== "string" || typeof expected !== "string") return false;
-      const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = escaped.replace(/%/g, ".*").replace(/_/g, ".");
-      return !new RegExp(`^${pattern}$`, "i").test(actual);
     }
     default:
       return true; // unknown op — pass through

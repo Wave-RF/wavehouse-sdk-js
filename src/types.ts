@@ -39,8 +39,11 @@ export interface WaveHouseError {
 
 // --- Filter operators ---
 
-/** SDK filter operators (translated to backend equivalents). */
-export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "like" | "not_like";
+/**
+ * SDK filter operators (translated to backend equivalents): the set the
+ * server's structured-query endpoint accepts. There is no negated `like`.
+ */
+export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "like";
 
 // --- Streaming types ---
 
