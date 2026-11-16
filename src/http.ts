@@ -16,7 +16,16 @@ interface RequestSpec {
   contentType?: string;
   params?: Record<string, string>;
   signal?: AbortSignal;
+  /**
+   * How safely a call can be sent twice. `read` (the default, and ingest, which
+   * dedupes) retries as before. `sql` and `pipe` may run a write, so they are
+   * resent only when the first attempt certainly did nothing — see `mayResend`.
+   */
+  kind?: CallKind;
 }
+
+/** @internal */
+export type CallKind = "read" | "pipe" | "sql";
 
 /** @internal */
 export interface HttpResult<T> {
@@ -81,6 +90,49 @@ function abortedResult<T>(): HttpResult<T> {
   };
 }
 
+// Errors from a connection that was never made, so no byte of the request left.
+const NEVER_SENT_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * True only when `fetch` failed before connecting. Node/undici put the system
+ * error on `cause` (an AggregateError of them when several addresses were
+ * tried); a browser's bare TypeError says nothing, so it reads as "may have
+ * been sent".
+ */
+function neverSent(e: unknown): boolean {
+  const seen = new Set<unknown>();
+  const check = (err: unknown): boolean => {
+    if (typeof err !== "object" || err === null || seen.has(err)) return false;
+    seen.add(err);
+    const { code, cause, errors } = err as { code?: unknown; cause?: unknown; errors?: unknown };
+    if (typeof code === "string" && NEVER_SENT_CODES.has(code)) return true;
+    if (Array.isArray(errors) && errors.length > 0 && errors.every(check)) return true;
+    return check(cause);
+  };
+  return check(e);
+}
+
+/**
+ * Whether an error answer may be sent again. A raw SQL statement or a write
+ * pipe may already have run, and a gateway can answer 5xx after it did, so
+ * those resend only on the server's own word that it is safe.
+ */
+function mayResendResponse(kind: CallKind, error: WaveHouseError, res: Response): boolean {
+  if (kind === "read") return true;
+  if (kind === "sql") return false;
+  const body = error.details as { retryable?: unknown } | undefined;
+  const serverSaid = typeof body?.retryable === "boolean";
+  if (serverSaid) return body?.retryable === true;
+  return res.status === 429 || (res.status === 503 && res.headers.has("Retry-After"));
+}
+
 /**
  * Internal fetch wrapper with auth injection, retry, backoff, and Retry-After.
  * @internal
@@ -111,6 +163,7 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
   // Content-Type/Accept this request needs.
   const finalHeaders = mergeHeaders(headers, ctx.options.headers);
 
+  const kind = opts.kind ?? "read";
   let lastError: WaveHouseError | null = null;
   const maxAttempts = ctx.options.maxRetries + 1;
 
@@ -138,6 +191,19 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       }
 
       const error = await parseErrorResponse(res);
+
+      if (!mayResendResponse(kind, error, res)) {
+        return { data: null, error, headers: res.headers };
+      }
+
+      // 429 is retried only for a call that may have run (`pipe`): a read
+      // keeps its behaviour, where only 5xx and a server `retryable` resend.
+      if (kind === "pipe" && res.status === 429 && attempt < maxAttempts - 1) {
+        const retryAfter = parseInt(res.headers.get("Retry-After") ?? "", 10);
+        await sleep(retryAfter > 0 ? retryAfter * 1000 : backoff(attempt), opts.signal);
+        lastError = error;
+        continue;
+      }
 
       // 503 with Retry-After: wait the specified duration
       if (res.status === 503) {
@@ -176,6 +242,8 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       }
 
       lastError = networkError(e);
+      // The request may have reached the server; resending could run it twice.
+      if (kind !== "read" && !neverSent(e)) break;
       if (attempt < maxAttempts - 1) {
         // This sleep is the one that runs inside the catch, so unlike the two
         // in the try above, an abort raised *by* the backoff would escape

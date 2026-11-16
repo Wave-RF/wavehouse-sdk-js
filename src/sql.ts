@@ -44,6 +44,7 @@ export async function sql<Row = Record<string, unknown>>(
     path: "/v1/ops/query",
     params: tenantParam(opts),
     body: { sql: query },
+    kind: "sql",
     signal: opts?.signal,
   });
   if (error) return err(error);
