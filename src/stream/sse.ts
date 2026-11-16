@@ -174,15 +174,16 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    */
   private _columns: string[] | null = null;
   /**
-   * Per-cause warning budget for the current connection. Every PER-FRAME warn
-   * site is bounded, keyed by CAUSE so a malformed schema frame and unparseable
-   * JSON stay individually visible: collapsing them behind one flag would hide
-   * the distinct failures the warning exists to surface, and an unbounded
-   * `console.warn` per frame floods the console for the whole connection. Reset
-   * per attempt. (The per-connect() notices are not per-frame and are not
-   * bounded here.)
+   * The frame that last broke a connection, kept so the connection that follows
+   * can tell a transient failure from a persistent one: the same frame failing
+   * again after a resume from `resumeId` is skipped (see `_pump`). Cleared once
+   * a frame of its kind is delivered or skipped.
    */
-  private _warnBudget = new Map<string, number>();
+  private _suspect: { kind: "data" | "schema"; id: string; resumeId: string | null } | null = null;
+  /** Frames seen on this connection, per kind; 0 means "the first one after resuming". */
+  private _seq = { data: 0, schema: 0 };
+  /** A schema frame was skipped on this connection, so its rows cannot be read. */
+  private _schemaSkipped = false;
 
   onEvent: ((event: StreamEvent<T>) => void) | null = null;
   onStatus: ((status: StreamStatus) => void) | null = null;
@@ -283,27 +284,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     }
   }
 
-  /**
-   * Warn at most `LIMIT` times per cause per connection, then once more to say
-   * how many were suppressed. Returns nothing — callers warn and bail as before.
-   */
-  private _warnBounded(cause: string, message: string, data: unknown): void {
-    const LIMIT = 3;
-    const seen = (this._warnBudget.get(cause) ?? 0) + 1;
-    this._warnBudget.set(cause, seen);
-    if (seen <= LIMIT) {
-      console.warn(message, data);
-    } else if (seen === LIMIT + 1) {
-      console.warn(`${message} — further occurrences suppressed for this connection`);
-    }
-  }
-
   /** One connection attempt: request, validate, then pump frames until it ends. */
   private async _attempt(): Promise<AttemptResult> {
     const ac = new AbortController();
     this._abort = ac;
     this._columns = null;
-    this._warnBudget.clear();
+    this._seq = { data: 0, schema: 0 };
+    this._schemaSkipped = false;
 
     // A URL that won't build is deterministic — every retry produces the same
     // failure — so it ends the stream rather than looping.
@@ -638,27 +625,53 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
           if (msg.id) this._lastEventId = msg.id;
           return;
         }
+        const kind = msg.event === "schema" ? "schema" : "data";
+        const id = msg.id ?? "";
+        const seq = this._seq[kind]++;
         // The server announces the column list before the rows that use it,
         // and again whenever it changes mid-stream.
-        if (msg.event === "schema") {
-          if (msg.id) this._lastEventId = msg.id;
-          this._applySchema(msg.data);
+        const problem =
+          kind === "schema"
+            ? this._applySchema(msg.data)
+            : this._schemaSkipped
+              ? "The column announcement for these rows was skipped"
+              : this._dispatch(msg.data);
+        if (problem === undefined) {
+          // Only after delivery: a frame that was refused must not move the
+          // resume point past itself, or the reconnect would skip it.
+          if (id) this._lastEventId = id;
+          if (this._suspect?.kind === kind) this._suspect = null;
+          if (kind === "schema") this._schemaSkipped = false;
           return;
         }
-        const problem = this._dispatch(msg.data);
-        if (problem !== undefined) {
-          broken = true;
+        // The same frame failing again after a resume from where it first
+        // failed is the frame, not the connection: skip it, say so once, and
+        // carry on from past it. Either its id matches, or it is the first
+        // frame of its kind on a connection resumed from the same point.
+        const s = this._suspect;
+        const again =
+          s?.kind === kind &&
+          ((id !== "" && id === s.id) || (seq === 0 && s.resumeId === this._lastEventId));
+        if (again || this._schemaSkipped) {
+          this._suspect = null;
+          if (kind === "schema") this._schemaSkipped = true;
+          if (id) this._lastEventId = id;
           this._emitError({
             status: 0,
-            code: "SSE_PROTOCOL_ERROR",
-            message: problem,
-            retryable: true,
+            code: "SSE_FRAME_DROPPED",
+            message: `Skipped a ${kind} frame${id ? ` (id ${id})` : ""}: ${problem}`,
+            retryable: false,
           });
           return;
         }
-        // Only after delivery: a frame that was refused must not move the
-        // resume point past itself, or the reconnect would skip it.
-        if (msg.id) this._lastEventId = msg.id;
+        broken = true;
+        this._suspect = { kind, id, resumeId: this._lastEventId };
+        this._emitError({
+          status: 0,
+          code: "SSE_PROTOCOL_ERROR",
+          message: problem,
+          retryable: true,
+        });
       },
       onRetry: (ms) => {
         this._retryFloorMs = Math.min(Math.max(ms, 0), MAX_BACKOFF_MS);
@@ -705,32 +718,29 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   }
 
   /**
-   * Record the column list an `event: schema` frame announces. Rows that follow
-   * are zipped against it, so a malformed announcement drops the list rather
-   * than keeping a stale one: mislabeling values is worse than delivering none.
+   * Record the column list an `event: schema` frame announces, or say why it
+   * can't be. Rows that follow are zipped against the list, so a malformed
+   * announcement drops it rather than keeping a stale one: mislabeling values
+   * is worse than delivering none. The reason never quotes the frame.
    */
-  private _applySchema(data: string): void {
+  private _applySchema(data: string): string | undefined {
+    this._columns = null;
+    let msg: { columns?: unknown };
     try {
-      const msg = JSON.parse(data) as { table_name?: string; columns?: unknown };
-      if (!Array.isArray(msg.columns) || msg.columns.some((c) => typeof c !== "string")) {
-        throw new Error("columns must be an array of strings");
-      }
-      // A repeated name has no single meaning when the row is zipped into an
-      // object: the later value wins and the earlier one vanishes, with no
-      // signal. Refuse the announcement instead — dropping rows until the next
-      // one is the same failure mode as a malformed frame, and it is loud.
-      if (new Set(msg.columns as string[]).size !== msg.columns.length) {
-        throw new Error("columns contains a duplicate name");
-      }
-      this._columns = msg.columns as string[];
+      msg = JSON.parse(data) as { columns?: unknown };
     } catch {
-      this._columns = null;
-      this._warnBounded(
-        "bad-schema-frame",
-        "[wavehouse] SSE received a malformed schema event:",
-        data,
-      );
+      return "A schema frame is not valid JSON";
     }
+    if (!Array.isArray(msg?.columns) || msg.columns.some((c) => typeof c !== "string")) {
+      return "A schema frame's columns are not an array of strings";
+    }
+    // A repeated name has no single meaning when the row is zipped into an
+    // object: the later value wins and the earlier one vanishes, with no signal.
+    if (new Set(msg.columns as string[]).size !== msg.columns.length) {
+      return "A schema frame names a column twice";
+    }
+    this._columns = msg.columns as string[];
+    return undefined;
   }
 
   /**
@@ -743,7 +753,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * which value is which, so it is never delivered under guessed names. Those
    * are protocol errors: the reason is returned, and the caller reopens the
    * connection from the last delivered event, so the server announces the
-   * columns again. Anything else wrong with a frame is warned about and dropped.
+   * columns again. So is a frame that is not valid JSON; the reason never quotes it.
    *
    * Guarded like `_emitError` and `_emitStatus`: `parser.feed()` dispatches
    * every complete frame in a chunk synchronously, so a subscriber that closes
@@ -758,13 +768,15 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     // Two failures with one culprit each, so they are caught separately: a
     // shared catch blamed the server's frame for an exception thrown by the
     // consumer's own handler, pointing a debugging reader at the wrong side.
-    let event: StreamEvent<T>;
+    let msg: { table_name: string; received_timestamp: string; row: unknown };
     try {
-      const msg = JSON.parse(data) as {
-        table_name: string;
-        received_timestamp: string;
-        row: unknown;
-      };
+      msg = JSON.parse(data);
+    } catch {
+      return "A data frame is not valid JSON";
+    }
+    if (typeof msg !== "object" || msg === null) return "A data frame is not a JSON object";
+    let event: StreamEvent<T>;
+    {
       const columns = this._columns;
       if (!columns) return "A data frame arrived before any schema frame";
       if (!Array.isArray(msg.row)) return "A data frame's row is not an array";
@@ -782,9 +794,6 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
         row[columns[i]] = msg.row[i];
       }
       event = { table: msg.table_name, timestamp: msg.received_timestamp, data: row as T };
-    } catch {
-      this._warnBounded("bad-json", "[wavehouse] SSE received malformed message:", data);
-      return undefined; // ignore malformed messages
     }
 
     try {

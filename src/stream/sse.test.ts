@@ -374,25 +374,6 @@ describe("SSETransport framing", () => {
     expect(seen.events[0].data).toEqual({ split: true });
     t.disconnect();
   });
-
-  it("warns on a malformed payload without emitting or erroring", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
-
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
-
-    conn.push("id: x\ndata: {not json\n\n");
-    await vi.waitFor(() => expect(warn).toHaveBeenCalled());
-
-    expect(seen.events).toHaveLength(0);
-    expect(seen.errors).toHaveLength(0);
-    t.disconnect();
-  });
 });
 
 describe("SSETransport positional rows", () => {
@@ -547,41 +528,6 @@ describe("SSETransport positional rows", () => {
     });
   });
 
-  it("bounds warnings per cause instead of one per frame", async () => {
-    // A per-frame warn for a malformed schema frame or unparseable JSON is one
-    // console line per frame for the whole connection. The volume is bounded,
-    // but per CAUSE — a flat boolean would hide whichever fired second.
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
-
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
-
-    for (let i = 0; i < 10; i++) {
-      conn.push(`event: schema\ndata: {"table_name":"clicks","columns":"not-an-array"}\n\n`);
-    }
-    await flush();
-    // 3 warnings + 1 "further occurrences suppressed", not 10.
-    expect(warn).toHaveBeenCalledTimes(4);
-    expect(String(warn.mock.calls[3][0])).toContain("suppressed");
-
-    // A DIFFERENT cause still gets its own budget — the point of keying by cause.
-    warn.mockClear();
-    for (let i = 0; i < 10; i++) {
-      conn.push(`data: {not json\n\n`);
-    }
-    await flush();
-    expect(warn).toHaveBeenCalledTimes(4);
-    expect(String(warn.mock.calls[3][0])).toContain("suppressed");
-
-    t.disconnect();
-    warn.mockRestore();
-  });
-
   it("refuses a schema frame that names a column twice", async () => {
     // Zipping a positional row against a duplicate name keeps the later value
     // and drops the earlier one, with no signal. Refusing the announcement is
@@ -607,7 +553,6 @@ describe("SSETransport positional rows", () => {
     await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
 
     expect(seen.events).toHaveLength(0);
-    expect(warn).toHaveBeenCalled();
     expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
 
     // A valid announcement on the new connection recovers the stream.
@@ -622,8 +567,8 @@ describe("SSETransport positional rows", () => {
     warn.mockRestore();
   });
 
-  it("drops a malformed schema event rather than keeping a stale column list", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("refuses a malformed schema event rather than keeping a stale column list", async () => {
+    vi.useFakeTimers();
     const f = makeFetch();
     const conn = streamingResponse();
     f.queue.push(() => conn.res);
@@ -641,12 +586,123 @@ describe("SSETransport positional rows", () => {
     // names the server no longer claims — worse than delivering nothing.
     conn.push(`event: schema\ndata: {"table_name":"clicks","columns":"nope"}\n\n`);
     conn.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b"] }));
-    await flush();
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
 
+    expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
     expect(seen.events).toHaveLength(1);
-    expect(warn).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
     t.disconnect();
-    warn.mockRestore();
+  });
+});
+
+describe("SSETransport frames that cannot be decoded", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  /** Two connections; `badFrame` is pushed on the first after a delivered row `t1`. */
+  async function setup() {
+    const f = makeFetch();
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const third = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+      () => third.res,
+    );
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
+    first.push(rowFrames("t1", "t1", { page: "/a" }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+    return { f, t, seen, first, second, third };
+  }
+  const reconnect = async (f: ReturnType<typeof makeFetch>, n: number) => {
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(n));
+  };
+
+  it("reconnects from the last delivered id on invalid JSON, and delivers the frame once it decodes", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push("id: t2\ndata: {not json\n\n");
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    expect(seen.errors[0]).toMatchObject({ code: "SSE_PROTOCOL_ERROR", retryable: true });
+    expect(seen.errors[0].message).not.toContain("not json");
+
+    await reconnect(f, 2);
+    // The refused frame did not move the resume point past itself.
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+    second.push(rowFrames("t2", "t2", { page: "/b" }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+    expect(seen.events[1].data).toEqual({ page: "/b" });
+    expect(seen.errors.map((e) => e.code)).toEqual(["SSE_PROTOCOL_ERROR"]);
+    t.disconnect();
+  });
+
+  it("skips a frame that fails again after the reconnect, with one drop error, and goes on", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push("id: t2\ndata: {not json secret-payload\n\n");
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    await reconnect(f, 2);
+
+    second.push(schemaFrame(["page"]));
+    second.push("id: t2\ndata: {not json secret-payload\n\n");
+    second.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: ["/c"] }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+
+    // Still the same connection: no third attempt.
+    expect(f.attempts).toHaveLength(2);
+    expect(seen.events[1].data).toEqual({ page: "/c" });
+    expect(seen.errors.map((e) => e.code)).toEqual(["SSE_PROTOCOL_ERROR", "SSE_FRAME_DROPPED"]);
+    const drop = seen.errors[1];
+    expect(drop.retryable).toBe(false);
+    expect(drop.message).toContain("t2");
+    expect(drop.message).toContain("not valid JSON");
+    expect(drop.message).not.toContain("secret-payload");
+
+    // The resume point is now past the skipped frame.
+    second.close();
+    await reconnect(f, 3);
+    expect(headersOf(f.attempts[2])["Last-Event-ID"]).toBe("t3");
+    t.disconnect();
+  });
+
+  it("skips a frame with no id that is the first data frame after resuming from the same point", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push("data: {bad\n\n");
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    await reconnect(f, 2);
+    second.push(schemaFrame(["page"]));
+    second.push("data: {bad\n\n");
+    second.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: ["/c"] }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+    expect(seen.errors.map((e) => e.code)).toEqual(["SSE_PROTOCOL_ERROR", "SSE_FRAME_DROPPED"]);
+    t.disconnect();
+  });
+
+  it("treats a schema frame with a duplicate column the same way", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push('id: s2\nevent: schema\ndata: {"columns":["a","a"]}\n\n');
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    await reconnect(f, 2);
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+
+    second.push('id: s2\nevent: schema\ndata: {"columns":["a","a"]}\n\n');
+    second.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: [1, 2] }));
+    await vi.waitFor(() => expect(seen.errors.length).toBeGreaterThanOrEqual(3));
+    // The schema is skipped once; rows that cannot be read are skipped, never delivered mislabeled.
+    expect(seen.errors.map((e) => e.code)).toEqual([
+      "SSE_PROTOCOL_ERROR",
+      "SSE_FRAME_DROPPED",
+      "SSE_FRAME_DROPPED",
+    ]);
+    expect(seen.events).toHaveLength(1);
+    expect(f.attempts).toHaveLength(2);
+    t.disconnect();
   });
 });
 
