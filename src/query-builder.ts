@@ -5,6 +5,7 @@ import { StreamController } from "./stream/controller.js";
 import { LiveQuery } from "./stream/live-query.js";
 import type {
   Aggregation,
+  Duration,
   FilterOp,
   HttpContext,
   OrderClause,
@@ -16,6 +17,58 @@ import type {
   StructuredQuery,
   TimeRange,
 } from "./types.js";
+
+/** Longest span the server's Go time.Duration holds: 2^63 - 1 ns. */
+const MAX_DURATION_NS = 2 ** 63;
+
+const NS_PER_UNIT: Record<string, number> = {
+  ms: 1e6,
+  s: 1e9,
+  m: 60e9,
+  h: 3600e9,
+  d: 86400e9,
+  w: 604800e9,
+};
+
+/** A `Date` as UTC ISO-8601, a string as given; an invalid `Date` is an error. */
+function timeBound(
+  v: Date | string,
+): { value: string; error?: undefined } | { value: ""; error: string } {
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return { value: "", error: "invalid Date" };
+    return { value: v.toISOString() };
+  }
+  return { value: v };
+}
+
+/**
+ * The server's relative form of a duration. The server runs Go's
+ * `time.ParseDuration` after expanding d and w, so a plain decimal and one of
+ * its units always parses there; anything that cannot, or is not above zero,
+ * is refused here.
+ */
+function durationString(d: Duration | number): string | { error: string } {
+  if (typeof d === "number") {
+    // String(1e21) is "1e+21", which Go cannot parse, so only plain decimals pass.
+    if (
+      !Number.isFinite(d) ||
+      d <= 0 ||
+      !/^\d+(\.\d+)?$/.test(String(d)) ||
+      d * 1e6 >= MAX_DURATION_NS
+    ) {
+      return { error: `duration must be a positive number of milliseconds, got ${d}` };
+    }
+    return `${d}ms`;
+  }
+  const m = typeof d === "string" ? /^(\d+(?:\.\d+)?)(ms|s|m|h|d|w)$/.exec(d) : null;
+  const ns = m ? Number(m[1]) * (NS_PER_UNIT[m[2] as string] as number) : 0;
+  if (!m || !(ns >= 1) || ns >= MAX_DURATION_NS) {
+    return {
+      error: `duration must be a positive number with a unit of ms, s, m, h, d or w, got ${JSON.stringify(d)}`,
+    };
+  }
+  return d;
+}
 
 /** SDK operator → backend operator mapping. */
 const OP_MAP: Record<FilterOp, string> = {
@@ -136,8 +189,42 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
     return this._clone({ limit: n });
   }
 
-  timeRange(column: string, since: string, until?: string): QueryBuilder<Row> {
-    return this._clone({ timeRange: { column, since, until } });
+  /**
+   * Keep rows where `column >= since AND column <= until`. `since` and `until`
+   * are each a `Date` (sent as `toISOString()`, UTC), an RFC 3339 string or a
+   * relative string such as `"1h"`, sent as given. A relative value means that
+   * long before the server's clock, not yours. The server rounds each bound
+   * down to `query.timestamp_bucket_seconds` (60 s by default), and ignores
+   * `until` when there is no `since`.
+   *
+   * Prefer a `Date` or `last()` to a hand-built string: `"now-1h"` is a 400,
+   * and `"-1h"` is accepted as a negative duration, which puts the bound in
+   * the future and matches nothing, without a word. An invalid `Date` resolves
+   * to an `INVALID_QUERY` error before anything is sent.
+   */
+  timeRange(column: string, since: Date | string, until?: Date | string): QueryBuilder<Row> {
+    const s = timeBound(since);
+    const u = until === undefined ? undefined : timeBound(until);
+    const bad = s.error ?? u?.error;
+    if (bad !== undefined) return this._clone({ error: this._state.error ?? `timeRange: ${bad}` });
+    return this._clone({ timeRange: { column, since: s.value, until: u?.value } });
+  }
+
+  /**
+   * Keep rows from the last `duration` by the server's clock: `last("ts", "1h")`.
+   * `duration` is a number of milliseconds (above 0) or a string such as `"90s"`,
+   * `"1h"`, `"7d"` or `"2w"` (units ms, s, m, h, d, w). It is the same as
+   * `timeRange(column, duration)`, but checked here: a zero, negative or
+   * unparseable duration resolves to an `INVALID_QUERY` error before anything is
+   * sent. The start rounds down to `query.timestamp_bucket_seconds` (60 s by
+   * default), so a window can reach back up to a bucket further than asked.
+   */
+  last(column: string, duration: Duration | number): QueryBuilder<Row> {
+    const d = durationString(duration);
+    if (typeof d !== "string") {
+      return this._clone({ error: this._state.error ?? `last: ${d.error}` });
+    }
+    return this._clone({ timeRange: { column, since: d } });
   }
 
   // --- Execution ---

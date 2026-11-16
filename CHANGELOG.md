@@ -4,6 +4,8 @@
 
 ### Added
 
+- `timeRange` takes a `Date` for `since` and `until`, sent as `toISOString()` (UTC); a string is still sent as given. An invalid `Date` resolves to an `INVALID_QUERY` error before any request.
+- `last(column, duration)` keeps rows from the last `duration` by the server's clock, as `wavehouse-sdk-go`'s `Last` does. `duration` is a number of milliseconds or a `Duration` string (`"90s"`, `"1h"`, `"7d"`; units ms, s, m, h, d, w), sent in the server's relative form. A zero, negative or unparseable duration is an `INVALID_QUERY` error before any request.
 - `wh.version()` returns the server's build (`version`, `git_commit`, `build_time`, `go_version`) from `GET /version`, as `wavehouse-sdk-go`'s `Version` does.
 - Documented: a multi-tenant deployment sets `options.headers: { "X-Tenant-ID": "acme" }`, which reaches every REST call and the stream unchanged. The shared conformance cases gain an optional `"headers"` map for it.
 

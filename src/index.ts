@@ -28,6 +28,7 @@ export type {
   Database,
   // DLQ
   DLQStats,
+  Duration,
   // HTTP
   FetchLike,
   // Query

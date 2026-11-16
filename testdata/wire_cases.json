@@ -138,11 +138,10 @@
     "expected_body": {"columns": ["*"]}
   },
   {
-    "name": "groupBy joins its columns to the selection",
-    "sdks": ["go"],
+    "name": "groupBy adds nothing to the selection",
     "endpoint": "query", "table": "clicks", "operations": [{"method": "count", "args": ["*", ""]}, {"method": "groupBy", "args": ["page", "button"]}],
     "expected_path": "/v1/query?table=clicks", "expected_method": "POST", "expected_content_type": "application/json",
-    "expected_body": {"columns": ["page", "button"], "group_by": ["page", "button"], "aggregations": [{"fn": "count", "column": "*", "alias": "count"}]}
+    "expected_body": {"group_by": ["page", "button"], "aggregations": [{"fn": "count", "column": "*", "alias": "count"}]}
   },
   {
     "name": "groupBy keeps the order of columns already selected",
@@ -383,10 +382,17 @@
     "expected_body": {"columns": ["page"], "limit": 1000, "time_range": {"column": "ts", "since": "2026-01-01T07:00:00.123456789-05:00", "until": "2026-02-01T00:00:00Z"}}
   },
   {
-    "name": "js: groupBy does not add its columns to the selection",
+    "name": "js: last sends a duration string as given",
     "sdks": ["js"],
-    "endpoint": "query", "table": "clicks", "operations": [{"method": "count", "args": ["*", ""]}, {"method": "groupBy", "args": ["page", "button"]}],
+    "endpoint": "query", "table": "clicks", "operations": [{"method": "select", "args": ["page"]}, {"method": "last", "args": ["ts", "7d"]}],
     "expected_path": "/v1/query?table=clicks", "expected_method": "POST", "expected_content_type": "application/json",
-    "expected_body": {"group_by": ["page", "button"], "limit": 1000, "aggregations": [{"fn": "count", "column": "*", "alias": "count"}]}
+    "expected_body": {"columns": ["page"], "limit": 1000, "time_range": {"column": "ts", "since": "7d"}}
+  },
+  {
+    "name": "js: last sends milliseconds as a duration string",
+    "sdks": ["js"],
+    "endpoint": "query", "table": "clicks", "operations": [{"method": "select", "args": ["page"]}, {"method": "last", "args": ["ts", 90000]}],
+    "expected_path": "/v1/query?table=clicks", "expected_method": "POST", "expected_content_type": "application/json",
+    "expected_body": {"columns": ["page"], "limit": 1000, "time_range": {"column": "ts", "since": "90000ms"}}
   }
 ]

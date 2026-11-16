@@ -221,6 +221,78 @@ describe("QueryBuilder", () => {
     expect(body.time_range).toEqual({ column: "ts", since: "2026-01-01", until: "2026-02-01" });
   });
 
+  it("sends a Date bound as UTC ISO-8601", async () => {
+    const since = new Date("2026-01-01T07:00:00.123-05:00");
+    await builder().timeRange("ts", since, new Date("2026-02-01T00:00:00Z")).fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.time_range).toEqual({
+      column: "ts",
+      since: "2026-01-01T12:00:00.123Z",
+      until: "2026-02-01T00:00:00.000Z",
+    });
+  });
+
+  it("refuses an invalid Date before sending", async () => {
+    for (const q of [
+      builder().timeRange("ts", new Date(Number.NaN)),
+      builder().timeRange("ts", "1h", new Date("nope")),
+    ]) {
+      const res = await q.fetch();
+      expect(res.error?.code).toBe("INVALID_QUERY");
+      expect(res.error?.message).toContain("invalid Date");
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // --- Last ---
+
+  it("builds last from a duration string, as given", async () => {
+    for (const d of ["1h", "7d", "2w", "90s", "15m", "500ms", "1.5h", "0.5d"] as const) {
+      fetchSpy.mockClear();
+      await builder().last("ts", d).fetch();
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.time_range).toEqual({ column: "ts", since: d });
+    }
+  });
+
+  it("builds last from milliseconds", async () => {
+    await builder().last("ts", 3_600_000).fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.time_range).toEqual({ column: "ts", since: "3600000ms" });
+  });
+
+  it("refuses a non-positive or unparseable last before sending", async () => {
+    const bad = [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      1e21,
+      1e-7,
+      1e13,
+      "0s",
+      "-1h",
+      "1x",
+      "h",
+      "1",
+      "",
+      "now-1h",
+      "1h30m",
+      " 1h",
+      "1y",
+      "999999999999d",
+    ];
+    for (const d of bad) {
+      const res = await builder()
+        .last("ts", d as never)
+        .fetch();
+      expect(res.error?.code, String(d)).toBe("INVALID_QUERY");
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   // --- Empty AST ---
 
   it("a bare query defaults to select_all and omits empty arrays", async () => {

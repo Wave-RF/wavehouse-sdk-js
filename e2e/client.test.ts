@@ -123,6 +123,44 @@ describe("query", () => {
     expect(res.data?.[0]).toEqual({ name, value: 20 });
   });
 
+  it("filters on timeRange with Dates", async () => {
+    const name = uniqueName("window");
+    const seeded = await wh.from("e2e_events").insert(eventRow(name, 1));
+    expect(seeded.error).toBeNull();
+    await rowsNamed(name, 1);
+    // Wide enough to absorb the server's bucket rounding and any clock skew.
+    const now = Date.now();
+    const inside = await wh
+      .from("e2e_events")
+      .select("name")
+      .where("name", "=", name)
+      .timeRange("ts", new Date(now - 3_600_000), new Date(now + 3_600_000));
+    expect(inside.error).toBeNull();
+    expect(inside.data?.length).toBeGreaterThanOrEqual(1);
+
+    const past = await wh
+      .from("e2e_events")
+      .select("name")
+      .where("name", "=", name)
+      .timeRange("ts", new Date(now - 7_200_000), new Date(now - 3_600_000));
+    expect(past.error).toBeNull();
+    expect(past.data).toHaveLength(0);
+  });
+
+  it("filters on last", async () => {
+    const name = uniqueName("last");
+    const seeded = await wh.from("e2e_events").insert(eventRow(name, 1));
+    expect(seeded.error).toBeNull();
+    await rowsNamed(name, 1);
+    const res = await wh
+      .from("e2e_events")
+      .select("name")
+      .where("name", "=", name)
+      .last("ts", "1h");
+    expect(res.error).toBeNull();
+    expect(res.data?.length).toBeGreaterThanOrEqual(1);
+  });
+
   it("aggregates", async () => {
     const res = await wh.from("e2e_events").select().sum("value", "total").where("name", "=", name);
     expect(res.error).toBeNull();

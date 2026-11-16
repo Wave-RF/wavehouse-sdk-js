@@ -162,6 +162,9 @@ function applyOps(table: TableRef, ops: WireCase["operations"]): QueryBuilder {
       case "timeRange":
         q = q.timeRange(a[0], a[1], (a[2] as string) === "" ? undefined : a[2]);
         break;
+      case "last":
+        q = q.last(a[0], a[1]);
+        break;
       case "count":
         q = q.count(a[0], alias(1));
         break;

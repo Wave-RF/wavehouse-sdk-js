@@ -71,7 +71,11 @@ const { data, error } = await wh
   .groupBy('page', 'button')
   .orderBy('total', 'desc')
   .limit(50)
-  .timeRange('received_timestamp', '1h');
+  .last('received_timestamp', '1h');
+
+// A window is last(column, '1h' | 90_000) on the server's clock, or
+// timeRange(column, since, until?) with Dates (sent as UTC ISO-8601) or strings.
+// A zero, negative or unparseable duration, or an invalid Date, is an INVALID_QUERY error.
 
 // Direction is "asc" or "desc" (case-insensitive); anything else is an INVALID_QUERY error.
 

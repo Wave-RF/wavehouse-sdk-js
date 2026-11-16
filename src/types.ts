@@ -276,6 +276,12 @@ export interface OrderClause {
   dir: "asc" | "desc";
 }
 
+/**
+ * A relative span for `last()`: a number and a unit, such as `"90s"`, `"1h"`,
+ * `"7d"` or `"2w"`. The units are ms, s, m, h, d and w.
+ */
+export type Duration = `${number}${"ms" | "s" | "m" | "h" | "d" | "w"}`;
+
 export interface TimeRange {
   column: string;
   since: string;
