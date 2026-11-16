@@ -71,7 +71,9 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
    * Select every column the caller's role is allowed to read (the all-columns
    * wildcard). Use this instead of `.select(...)` when you want a full-row read;
    * a bare `.fetch()` with no `.select()` does this implicitly. Mutually
-   * exclusive with `.select(...)`.
+   * exclusive with `.select(...)` and the aggregation methods: a query that
+   * combines them, in either order, resolves to an `INVALID_QUERY` error
+   * without being sent.
    */
   selectAll(): QueryBuilder<Row> {
     return this._clone({ selectAll: true });
@@ -132,6 +134,20 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
   static readonly DEFAULT_LIMIT = 1000;
 
   async fetch(opts?: RequestOptions): Promise<Result<Row[]>> {
+    // The server refuses select_all next to columns or aggregations with a
+    // 400; saying so here, in either call order, saves the round trip and
+    // names the cause.
+    if (
+      this._state.selectAll &&
+      (this._state.columns.length > 0 || this._state.aggregations.length > 0)
+    ) {
+      return err({
+        status: 0,
+        code: "INVALID_QUERY",
+        message: "selectAll() can't be combined with select() columns or aggregations",
+        retryable: false,
+      });
+    }
     const effectiveLimit = opts?.limit ?? this._state.limit ?? QueryBuilder.DEFAULT_LIMIT;
     const ast = this._buildAST(effectiveLimit);
 

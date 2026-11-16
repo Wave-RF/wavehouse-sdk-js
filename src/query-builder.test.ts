@@ -405,6 +405,30 @@ describe("QueryBuilder", () => {
     expect(received[0].page).toBe("/home");
   });
 
+  describe("selectAll() exclusivity", () => {
+    const cases: [string, () => QueryBuilder][] = [
+      ["select() then selectAll()", () => builder().select("page").selectAll()],
+      ["selectAll() then select()", () => builder().selectAll().select("page")],
+      ["selectAll() then count()", () => builder().selectAll().count()],
+      ["count() then selectAll()", () => builder().count().selectAll()],
+    ];
+
+    it.each(cases)("%s resolves to INVALID_QUERY and sends nothing", async (_name, make) => {
+      const result = await make().fetch();
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("INVALID_QUERY");
+      expect(result.error?.retryable).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("still sends selectAll() alone, and with filters and ordering", async () => {
+      await builder().selectAll().where("score", ">", 1).orderBy("score").fetch();
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.select_all).toBe(true);
+      expect(body.columns).toBeUndefined();
+    });
+  });
+
   it("offers no cacheTTL(): the server picks the cache TTL, so a setter could only mislead", () => {
     expect("cacheTTL" in builder()).toBe(false);
   });
