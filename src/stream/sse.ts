@@ -114,6 +114,12 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * resumption point mid-stream and re-open from the beginning.
    */
   private _lastEventId: string | null = null;
+  /**
+   * Where a reconnect resumes when there is neither `opts.since` nor an event
+   * id yet: the start of the first live connection, so rows ingested during
+   * the backoff are replayed rather than skipped at the live head.
+   */
+  private _resumeSince: string | null = null;
   /** Reconnect floor most recently requested by the server via `retry:`. */
   private _retryFloorMs = 0;
   /** Cuts a reconnect gap short when set — see `_sleep`. */
@@ -392,6 +398,14 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       return { liveMs: 0, terminal: true };
     }
 
+    if (!this._opts.since && !this._lastEventId && !this._resumeSince) {
+      // The server's clock, since that is what `since` is compared against.
+      // `Date` has whole-second resolution, so it is never later than the real
+      // start; without it, local time less a skew allowance.
+      const date = Date.parse(res.headers.get("Date") ?? "");
+      this._resumeSince = new Date(Number.isNaN(date) ? Date.now() - 5000 : date).toISOString();
+    }
+
     this._emitStatus("live");
     const openedAt = Date.now();
     await this._pump(body);
@@ -411,8 +425,9 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       );
     }
     url.searchParams.set("table", this._opts.table);
-    if (this._opts.since) {
-      url.searchParams.set("since", this._opts.since);
+    const since = this._opts.since || this._resumeSince;
+    if (since) {
+      url.searchParams.set("since", since);
     }
     return url.toString();
   }

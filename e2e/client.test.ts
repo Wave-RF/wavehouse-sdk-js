@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, inject, it } from "vitest";
+import { createClient } from "../src/index.js";
 import { collect, eventRow, eventually, newClient, uniqueName } from "./helpers.js";
 
 const wh = newClient();
@@ -177,6 +178,61 @@ describe("stream", () => {
       // Give a late non-matching event a moment to show up before asserting its absence.
       await new Promise((r) => setTimeout(r, 500));
       expect(events.map((e) => (e.data as Row).name)).toEqual([want]);
+    } finally {
+      stream.close();
+    }
+  });
+
+  it("delivers a row ingested while an early reconnect was backing off", async () => {
+    // Drop the first stream connection once it is live and before any event,
+    // so the reconnect has no Last-Event-ID and only the connection's own
+    // start to resume from.
+    let drop: (() => void) | undefined;
+    let streams = 0;
+    const token = inject("adminToken");
+    const dropping = createClient({
+      baseURL: inject("serverUrl"),
+      auth: () => token,
+      options: {
+        fetch: async (url, init) => {
+          const res = await fetch(url, init);
+          if (!url.includes("/v1/stream") || ++streams > 1 || !res.body) return res;
+          const reader = res.body.getReader();
+          const body = new ReadableStream<Uint8Array>({
+            start(ctrl) {
+              drop = () => {
+                reader.cancel().catch(() => {});
+                ctrl.close();
+              };
+            },
+            async pull(ctrl) {
+              try {
+                const { done, value } = await reader.read();
+                if (done) ctrl.close();
+                else ctrl.enqueue(value);
+              } catch {
+                // The test dropped the connection.
+              }
+            },
+          });
+          return new Response(body, { status: res.status, headers: res.headers });
+        },
+      },
+    });
+
+    const name = uniqueName("early-reconnect");
+    const stream = dropping.from("e2e_events").stream();
+    const { done } = collect(stream, 1);
+    try {
+      await stream.connected();
+      drop?.();
+      // During the backoff: the row lands after the drop and before the re-dial.
+      const res = await wh.from("e2e_events").insert(eventRow(name, 1));
+      expect(res.error).toBeNull();
+
+      const events = (await done).filter((e) => (e.data as Row).name === name);
+      expect(events).toHaveLength(1);
+      expect(streams).toBeGreaterThan(1);
     } finally {
       stream.close();
     }
