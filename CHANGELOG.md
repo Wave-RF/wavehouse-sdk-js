@@ -27,6 +27,7 @@
 
 ### Internal
 
+- The conformance runner no longer injects the JS default `limit: 1000` into every query case, which let the shared "no limit is sent unless set" case pass while this SDK did the opposite. That case is Go-only, the query cases that relied on the injection set an explicit limit, and `js: bare query sends the default limit` pins the default here. `testdata/wire_cases.json` is unchanged in step with `wavehouse-sdk-go`.
 - Request-conformance tests: `src/conformance.test.ts` replays the cases shared with `wavehouse-sdk-go` (`testdata/wire_cases.json`) and checks the exact request each call sends. Fixes #3.
 
 ### Deprecated

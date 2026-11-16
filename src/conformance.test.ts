@@ -38,14 +38,6 @@ const cases: WireCase[] = JSON.parse(
   readFileSync(new URL("../testdata/wire_cases.json", import.meta.url), "utf8"),
 );
 
-/**
- * The query builder sends `limit: 1000` when none is set (until
- * Wave-RF/WaveHouse#999); the shared cases describe the Go SDK, which sends
- * none. Applied here once, so a case without a limit op expects the default,
- * and `sdks`-scoped cases pin each side's own behaviour.
- */
-const DEFAULT_LIMIT = 1000;
-
 interface Seen {
   url: URL;
   init: RequestInit;
@@ -228,13 +220,7 @@ describe("request conformance (shared cases)", () => {
         const lines = got.body.split("\n");
         expect(lines.map((l) => JSON.parse(l))).toEqual(tc.expected_ndjson);
       } else if (tc.expected_body !== undefined) {
-        let want = tc.expected_body;
-        const sdkDefault =
-          tc.endpoint === "query" &&
-          !tc.sdks &&
-          !(tc.operations ?? []).some((o) => o.method === "limit");
-        if (sdkDefault) want = { ...(want as object), limit: DEFAULT_LIMIT };
-        expect(JSON.parse(got.body)).toEqual(want);
+        expect(JSON.parse(got.body)).toEqual(tc.expected_body);
       } else {
         expect(got.body).toBe("");
       }
