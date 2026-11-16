@@ -73,6 +73,8 @@ const { data, error } = await wh
   .limit(50)
   .timeRange('received_timestamp', '1h');
 
+// Direction is "asc" or "desc" (case-insensitive); anything else is an INVALID_QUERY error.
+
 // Raw SQL (requires admin role)
 const { data } = await wh.sql('SELECT page, count() FROM clicks GROUP BY page LIMIT 10');
 
@@ -110,6 +112,16 @@ let result = await wh.from('clicks').select().orderBy('received_timestamp', 'des
 while (result.hasMore && result.next) {
   result = await result.next();
 }
+```
+
+### Tenants and server version
+
+```ts
+// A multi-tenant server: data routes send X-Tenant-ID, admin routes ?tenant=.
+const acme = createClient({ baseURL: '...', options: { tenant: 'acme' } });
+const beta = acme.withTenant('beta'); // a copy for another tenant
+
+const { data: build } = await acme.version(); // GET /version: { version, git_commit, build_time, go_version }
 ```
 
 ## Type Safety

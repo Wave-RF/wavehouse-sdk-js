@@ -170,6 +170,32 @@ describe("QueryBuilder", () => {
     expect(body.order_by).toEqual([{ column: "score", dir: "desc" }]);
   });
 
+  it("lowercases the orderBy direction", async () => {
+    await builder()
+      .orderBy("score", "DESC" as "desc")
+      .fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.order_by).toEqual([{ column: "score", dir: "desc" }]);
+  });
+
+  it("refuses an orderBy direction that is not asc or desc, sending nothing", async () => {
+    const res = await builder()
+      .orderBy("score", "up" as "asc")
+      .fetch();
+
+    expect(res.error?.code).toBe("INVALID_QUERY");
+    expect(res.error?.message).toContain("orderBy");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("omits an empty aggregate alias", async () => {
+    await builder().aggregate("uniqExact", "user_id", "").fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.aggregations).toEqual([{ fn: "uniqExact", column: "user_id" }]);
+  });
+
   // --- Limit ---
 
   it("builds limit", async () => {

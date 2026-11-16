@@ -135,6 +135,15 @@ export interface ClientConfig<_DB extends Database = Database> {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface ClientOptions {
+  /**
+   * Scope the client to one tenant of a multi-tenant server. Data routes
+   * (`/v1/ingest`, `/v1/query`, `/v1/pipes/*`, `/v1/stream`, `/v1/health`) send
+   * it as `X-Tenant-ID`; admin routes (`/v1/ops/*`) send it as `?tenant=`,
+   * unless the call passes its own `opts.tenant`. `GET /version` sends neither.
+   * Empty or omitted sends nothing, which the server reads as the default
+   * tenant. `wh.withTenant(id)` derives a client for another tenant.
+   */
+  tenant?: string;
   /** Maximum retry attempts for failed requests. Default: 2. */
   maxRetries?: number;
   /**
@@ -256,7 +265,8 @@ export interface StructuredQuery {
 export interface Aggregation {
   fn: string;
   column: string;
-  alias: string;
+  /** Omitted from the wire when empty; the server then names the column. */
+  alias?: string;
 }
 
 export interface QueryFilter {
@@ -505,6 +515,16 @@ export interface OpsRequestOptions {
   tenant?: string;
 }
 
+/** The server's build, from `GET /version`. */
+export interface VersionInfo {
+  /** The release without its leading "v", or a pseudo-version. */
+  version: string;
+  git_commit: string;
+  build_time: string;
+  /** The server's Go runtime. */
+  go_version: string;
+}
+
 // --- Stream options ---
 
 export interface StreamOptions {
@@ -517,6 +537,8 @@ export interface StreamOptions {
 /** @internal */
 export interface HttpContext {
   baseURL: string;
+  /** The client's tenant; empty or absent sends none. */
+  tenant?: string;
   auth?: () => Promise<string> | string;
   // `fetch` stays optional rather than defaulted here, to keep the global late-bound.
   options: {

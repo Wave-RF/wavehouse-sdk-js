@@ -1,4 +1,6 @@
 import { DLQNamespace } from "./dlq.js";
+import { err, ok } from "./errors.js";
+import { request } from "./http.js";
 import { PipeRef, PipesNamespace } from "./pipes.js";
 import { SchemaNamespace } from "./schema.js";
 import { SettingsNamespace } from "./settings.js";
@@ -14,6 +16,7 @@ import type {
   OpsRequestOptions,
   Result,
   StreamOptions,
+  VersionInfo,
 } from "./types.js";
 
 type TableName<DB> = DB extends Database ? Extract<keyof DB, string> : string;
@@ -39,8 +42,16 @@ export class WaveHouseClient<DB extends Database = Database> {
   readonly settings: SettingsNamespace;
 
   constructor(config: ClientConfig<DB>) {
+    // Request paths are joined onto the base, so a query or fragment on it
+    // could only ever be dropped; say so rather than lose it silently.
+    if (/[?#]/.test(config.baseURL)) {
+      throw new TypeError(
+        `baseURL ${JSON.stringify(config.baseURL)} must not carry a query string or fragment: give the origin and an optional path prefix, such as "https://example.com/api"`,
+      );
+    }
     this._ctx = {
       baseURL: config.baseURL.replace(/\/+$/, ""),
+      tenant: config.options?.tenant || undefined,
       auth: config.auth,
       options: {
         maxRetries: config.options?.maxRetries ?? 2,
@@ -56,6 +67,33 @@ export class WaveHouseClient<DB extends Database = Database> {
     this.sys = new SysNamespace(this._ctx);
     this.pipes = new PipesNamespace(this._ctx);
     this.settings = new SettingsNamespace(this._ctx);
+  }
+
+  /**
+   * A copy of this client scoped to tenant `id`, with the same connection
+   * settings. An empty id addresses the default tenant. See `options.tenant`
+   * for how the tenant is sent.
+   */
+  withTenant(id: string): WaveHouseClient<DB> {
+    return new WaveHouseClient<DB>({
+      baseURL: this._ctx.baseURL,
+      auth: this._ctx.auth,
+      options: { ...this._ctx.options, tenant: id },
+    });
+  }
+
+  /**
+   * The server's build metadata, from `GET /version`. Needs no tenant and sends
+   * none.
+   */
+  async version(opts?: { signal?: AbortSignal }): Promise<Result<VersionInfo>> {
+    const { data, error } = await request<VersionInfo>(this._ctx, {
+      method: "GET",
+      path: "/version",
+      signal: opts?.signal,
+    });
+    if (error) return err(error);
+    return ok(data!);
   }
 
   /** Get a table reference for building queries, inserts, and streams. */
@@ -112,6 +150,7 @@ export class WaveHouseClient<DB extends Database = Database> {
       auth: this._ctx.auth,
       fetch: this._ctx.options.fetch,
       headers: this._ctx.options.headers,
+      tenant: this._ctx.tenant,
       fetchOptions: this._ctx.options.fetchOptions,
     });
     const controller = new StreamController<T>(transport);

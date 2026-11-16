@@ -39,6 +39,8 @@ interface QueryState {
   orderBy: OrderClause[];
   limit?: number;
   timeRange?: TimeRange;
+  /** First builder misuse; `fetch()` returns it before sending anything. */
+  error?: string;
 }
 
 type CreateStreamFn<Row> = (table: string, opts?: StreamOptions) => StreamController<Row>;
@@ -108,7 +110,7 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
     return this._addAgg("countDistinct", column, alias);
   }
 
-  aggregate(fn: string, column: string, alias: string): QueryBuilder<Row> {
+  aggregate(fn: string, column: string, alias = ""): QueryBuilder<Row> {
     return this._addAgg(fn, column, alias);
   }
 
@@ -117,7 +119,17 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
   }
 
   orderBy(column: string, dir: "asc" | "desc" = "asc"): QueryBuilder<Row> {
-    return this._clone({ orderBy: [...this._state.orderBy, { column, dir }] });
+    // The server reads anything but "desc" as ascending, so "DESC" would sort
+    // the wrong way without a word; lowercase it and refuse what is not a direction.
+    const d = String(dir).toLowerCase();
+    if (d !== "asc" && d !== "desc") {
+      return this._clone({
+        error:
+          this._state.error ??
+          `orderBy direction must be "asc" or "desc", got ${JSON.stringify(dir)}`,
+      });
+    }
+    return this._clone({ orderBy: [...this._state.orderBy, { column, dir: d }] });
   }
 
   limit(n: number): QueryBuilder<Row> {
@@ -134,6 +146,14 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
   static readonly DEFAULT_LIMIT = 1000;
 
   async fetch(opts?: RequestOptions): Promise<Result<Row[]>> {
+    if (this._state.error) {
+      return err({
+        status: 0,
+        code: "INVALID_QUERY",
+        message: this._state.error,
+        retryable: false,
+      });
+    }
     // The server refuses select_all next to columns or aggregations with a
     // 400; saying so here, in either call order, saves the round trip and
     // names the cause.
@@ -221,7 +241,8 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
   }
 
   private _addAgg(fn: string, column: string, alias: string): QueryBuilder<Row> {
-    const agg: Aggregation = { fn, column, alias };
+    // No alias: send none, and the server names the column.
+    const agg: Aggregation = alias === "" ? { fn, column } : { fn, column, alias };
     return this._clone({ aggregations: [...this._state.aggregations, agg] });
   }
 

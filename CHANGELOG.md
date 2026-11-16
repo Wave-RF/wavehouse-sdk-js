@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- `wh.version()` returns the server's build (`version`, `git_commit`, `build_time`, `go_version`) from `GET /version`, as `wavehouse-sdk-go`'s `Version` does.
+- `options.tenant` and `wh.withTenant(id)` scope a client to one tenant. Data routes send `X-Tenant-ID`; admin routes (`/v1/ops/*`) send `?tenant=`, where a per-call `opts.tenant` still wins; `/version` sends neither. An empty id sends nothing.
+
+### Changed
+
+- `orderBy()` lowercases its direction and resolves a direction other than `asc` or `desc` to an `INVALID_QUERY` error before anything is sent. The server read `"DESC"` as ascending.
+- `aggregate()` with an empty alias omits `alias` from the request instead of sending `""`.
+- A `baseURL` carrying a query string or fragment throws at construction, naming the problem; it used to be dropped silently.
+
 ### Breaking
 
 - Removed `"not_like"` from `FilterOp`. It type-checked and then failed with a 400 on a query, because the server's filter builder has no such operator. Use a positive `like`, or filter the rows you get back. Fixes #53.

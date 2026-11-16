@@ -12,6 +12,7 @@ export interface SSEOptions {
   auth?: () => Promise<string> | string;
   fetch?: FetchLike;
   headers?: Record<string, string>;
+  tenant?: string;
   fetchOptions?: RequestInit;
 }
 
@@ -489,6 +490,8 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
         base.Authorization = `Bearer ${token}`;
       }
     }
+
+    if (this._opts.tenant) base["X-Tenant-ID"] = this._opts.tenant;
 
     // The server reads the event id as the resume timestamp. Before any event
     // has been delivered there is no id, so `_url` sends `since` instead.

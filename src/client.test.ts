@@ -58,6 +58,11 @@ describe("createClient", () => {
     expect(client._ctx.options.maxRetries).toBe(5);
   });
 
+  it("throws on a baseURL carrying a query string or fragment", () => {
+    expect(() => createClient({ baseURL: "http://localhost:8080/api?x=1" })).toThrow(/query/);
+    expect(() => createClient({ baseURL: "http://localhost:8080/api#top" })).toThrow(/fragment/);
+  });
+
   it("passes auth function to context", () => {
     const authFn = () => Promise.resolve("token");
     const client = createClient({ baseURL: "http://localhost:8080", auth: authFn });
@@ -375,5 +380,67 @@ describe("stream error delivery", () => {
     await vi.waitFor(() => expect(errors).toHaveLength(1));
     expect((errors[0] as { code: string }).code).toBe("SSE_CONNECT_ERROR");
     expect(statuses).toContain("closed");
+  });
+});
+
+describe("tenant", () => {
+  const calls: { url: URL; headers: Record<string, string> }[] = [];
+  const fetchStub: FetchLike = async (url, init) => {
+    calls.push({ url: new URL(url), headers: (init?.headers ?? {}) as Record<string, string> });
+    return new Response("[]", { status: 200 });
+  };
+  const make = (tenant?: string) =>
+    createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: fetchStub, maxRetries: 0, tenant },
+    });
+  beforeEach(() => {
+    calls.length = 0;
+  });
+
+  it("sends X-Tenant-ID on data routes and ?tenant= on admin routes", async () => {
+    const wh = make("acme");
+    await wh.sys.health();
+    await wh.pipes.list();
+    expect(calls[0].headers["X-Tenant-ID"]).toBe("acme");
+    expect(calls[0].url.searchParams.has("tenant")).toBe(false);
+    expect(calls[1].headers["X-Tenant-ID"]).toBeUndefined();
+    expect(calls[1].url.searchParams.get("tenant")).toBe("acme");
+  });
+
+  it("lets a per-call tenant win on admin routes", async () => {
+    await make("acme").pipes.list({ tenant: "other" });
+    expect(calls[0].url.searchParams.getAll("tenant")).toEqual(["other"]);
+  });
+
+  it("sends nothing without a tenant, and none on /version", async () => {
+    await make().sys.health();
+    await make("acme").version();
+    expect(calls[0].headers["X-Tenant-ID"]).toBeUndefined();
+    expect(calls[1].url.pathname).toBe("/version");
+    expect(calls[1].headers["X-Tenant-ID"]).toBeUndefined();
+    expect(calls[1].url.search).toBe("");
+  });
+
+  it("withTenant returns a rescoped copy and leaves the original alone", async () => {
+    const base = make("acme");
+    const other = base.withTenant("beta");
+    await other.sys.health();
+    await base.sys.health();
+    expect(calls[0].headers["X-Tenant-ID"]).toBe("beta");
+    expect(calls[1].headers["X-Tenant-ID"]).toBe("acme");
+  });
+});
+
+describe("version", () => {
+  it("returns the server build from GET /version", async () => {
+    const info = { version: "1.2.3", git_commit: "abc", build_time: "t", go_version: "go1" };
+    const wh = createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: async () => new Response(JSON.stringify(info), { status: 200 }) },
+    });
+    const res = await wh.version();
+    expect(res.error).toBeNull();
+    expect(res.data).toEqual(info);
   });
 });

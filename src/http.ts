@@ -81,6 +81,15 @@ export function tenantParam(opts?: OpsRequestOptions): Record<string, string> | 
   return opts?.tenant === undefined ? undefined : { tenant: opts.tenant };
 }
 
+function isOpsRoute(path: string): boolean {
+  return path === "/v1/ops" || path.startsWith("/v1/ops/");
+}
+
+/** Every /v1 route that resolves its tenant from `X-Tenant-ID`. */
+function isDataRoute(path: string): boolean {
+  return path.startsWith("/v1/") && !isOpsRoute(path);
+}
+
 /** The documented shape for a cancelled request: a Result, never a throw. */
 function abortedResult<T>(): HttpResult<T> {
   return {
@@ -138,7 +147,13 @@ function mayResendResponse(kind: CallKind, error: WaveHouseError, res: Response)
  * @internal
  */
 export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<HttpResult<T>> {
-  const url = resolveURL(ctx.baseURL, opts.path, opts.params).toString();
+  // An explicit per-call `tenant` (even an empty one, which the server refuses)
+  // outranks the client's.
+  const params =
+    ctx.tenant && isOpsRoute(opts.path) && !(opts.params && "tenant" in opts.params)
+      ? { ...opts.params, tenant: ctx.tenant }
+      : opts.params;
+  const url = resolveURL(ctx.baseURL, opts.path, params).toString();
   const headers: Record<string, string> = {
     Accept: "application/json",
   };
@@ -164,6 +179,10 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
       headers.Authorization = `Bearer ${token}`;
     }
   }
+
+  // The client's tenant, on the data routes only; the admin routes take it as
+  // `?tenant=` (below), and /version takes neither.
+  if (ctx.tenant && isDataRoute(opts.path)) headers["X-Tenant-ID"] = ctx.tenant;
 
   // After auth, so `auth` keeps ownership of Authorization, and after the
   // Content-Type/Accept this request needs.

@@ -29,6 +29,26 @@ describe("health", () => {
   });
 });
 
+describe("version", () => {
+  it("reports the server build", async () => {
+    const res = await wh.version();
+    expect(res.error).toBeNull();
+    expect(res.data?.version).toBeTruthy();
+    expect(res.data?.go_version).toMatch(/^go/);
+  });
+});
+
+describe("tenant", () => {
+  // "0" is the default tenant, the one every server has.
+  it("serves a data route and an admin route for the default tenant", async () => {
+    const scoped = wh.withTenant("0");
+    expect((await scoped.sys.health()).error).toBeNull();
+    const res = await scoped.schema.list();
+    expect(res.error).toBeNull();
+    expect(Object.keys(res.data ?? {})).toContain("e2e_events");
+  });
+});
+
 describe("schema", () => {
   it("lists the fixture table", async () => {
     const res = await wh.schema.list();

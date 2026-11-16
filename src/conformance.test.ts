@@ -49,6 +49,7 @@ interface Seen {
 }
 
 function answer(path: string, search: URLSearchParams): string {
+  if (path === "/version") return '{"version":"1","git_commit":"","build_time":"","go_version":""}';
   if (path === "/v1/ingest") return '{"total":0,"succeeded":0,"failed":0,"duplicates":0}';
   if (path === "/v1/ops/settings/reload") return '{"adopted":true}';
   if (path === "/v1/ops/schema" && search.has("table")) return '{"name":"events","columns":[]}';
@@ -74,9 +75,12 @@ async function run(tc: WireCase): Promise<Seen[]> {
       headers: { "Content-Type": "application/json" },
     });
   };
+  // The data routes take the tenant from the client; the admin routes' cases
+  // pass it per call, which also pins that a call-level tenant is honored.
+  const dataTenant = ["query", "ingest", "pipe", "health", "version"].includes(tc.endpoint);
   const wh = createClient({
     baseURL: "http://wavehouse.test",
-    options: { fetch, maxRetries: 0 },
+    options: { fetch, maxRetries: 0, tenant: dataTenant ? tc.tenant : undefined },
   });
   const ops = tc.operations ?? [];
   const opts = tc.tenant === undefined ? undefined : { tenant: tc.tenant };
@@ -98,6 +102,9 @@ async function run(tc: WireCase): Promise<Seen[]> {
       break;
     case "health":
       await wh.sys.health();
+      break;
+    case "version":
+      await wh.version();
       break;
     case "schema_list":
       await wh.schema.list(opts);
