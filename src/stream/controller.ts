@@ -20,6 +20,10 @@ export class StreamController<T = Record<string, unknown>> {
   private _buffer: StreamEvent<T>[] = [];
   private _waiters: { resolve: (value: IteratorResult<StreamEvent<T>>) => void }[] = [];
   private _done = false;
+  /** An async iterator has been requested, so `_buffer` has a reader. */
+  private _iterated = false;
+  /** A callback subscriber has registered, so events have a consumer without the buffer. */
+  private _subscribed = false;
 
   constructor(transport: StreamTransport<T>) {
     this._transport = transport;
@@ -32,7 +36,11 @@ export class StreamController<T = Record<string, unknown>> {
       const waiter = this._waiters.shift();
       if (waiter) {
         waiter.resolve({ value: event, done: false });
-      } else {
+      } else if (this._iterated || !this._subscribed) {
+        // Queue only for a reader that exists or may still come: an iterator
+        // started late must see what arrived before it. Once a callback
+        // subscriber has taken the events and nobody iterates, nothing would
+        // ever drain the queue, so it would just grow with the stream.
         this._buffer.push(event);
       }
     };
@@ -127,6 +135,12 @@ export class StreamController<T = Record<string, unknown>> {
   /** Subscribe to stream events via callbacks. Returns an unsubscribe function. */
   subscribe(subscriber: StreamSubscriber<T>): () => void {
     this._subscribers.add(subscriber);
+    if (!this._subscribed) {
+      this._subscribed = true;
+      // Events queued before the first subscriber have no reader unless an
+      // iterator was started; drop them rather than hold them forever.
+      if (!this._iterated) this._buffer = [];
+    }
     subscriber.status?.(this._status);
 
     return () => {
@@ -160,11 +174,14 @@ export class StreamController<T = Record<string, unknown>> {
       w.resolve({ value: undefined as never, done: true });
     }
     this._waiters = [];
+    // Nothing reads the queue of a callback-only stream; an iterator may still drain it.
+    if (this._subscribed && !this._iterated) this._buffer = [];
   }
 
   /** Async iterator protocol — enables `for await (const event of stream)`. */
   [Symbol.asyncIterator](): AsyncIterableIterator<StreamEvent<T>> {
     const self = this;
+    this._iterated = true;
     return {
       next(): Promise<IteratorResult<StreamEvent<T>>> {
         if (self._buffer.length > 0) {

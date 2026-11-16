@@ -250,4 +250,57 @@ describe("StreamController", () => {
       expect(received).toEqual([event1, event2]);
     });
   });
+
+  describe("buffering", () => {
+    // Reaches into the private queue: its size is the thing under test, and
+    // there is no public way to observe memory a callback consumer never reads.
+    const queued = (c: unknown) => (c as { _buffer: unknown[] })._buffer.length;
+
+    it("does not queue events for a callback-only subscriber", () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      ctrl.subscribe({ next: () => {} });
+      for (let i = 0; i < 1000; i++) t.fireEvent(event1);
+      expect(queued(ctrl)).toBe(0);
+    });
+
+    it("drops events queued before the first subscriber when nobody iterates", () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      t.fireEvent(event1);
+      expect(queued(ctrl)).toBe(1);
+      ctrl.subscribe({ next: () => {} });
+      expect(queued(ctrl)).toBe(0);
+    });
+
+    it("still queues for an iterator started after events and a subscriber", async () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      const iter = ctrl[Symbol.asyncIterator]();
+      ctrl.subscribe({ next: () => {} });
+      t.fireEvent(event1);
+      expect((await iter.next()).value).toEqual(event1);
+      t.fireEvent(event2);
+      expect(queued(ctrl)).toBe(1);
+    });
+
+    it("clears the queue on close() of a callback-only stream", () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      const unsub = ctrl.subscribe({ next: () => {} });
+      unsub();
+      expect(ctrl.status).toBe("closed");
+      expect(queued(ctrl)).toBe(0);
+    });
+
+    it("lets an iterator drain what was queued before close()", async () => {
+      const t = makeTransport();
+      const ctrl = new StreamController(t);
+      t.fireEvent(event1);
+      ctrl.close();
+      const seen: StreamEvent[] = [];
+      for await (const e of ctrl) seen.push(e);
+      expect(seen).toEqual([event1]);
+    });
+  });
 });
