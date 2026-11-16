@@ -38,6 +38,31 @@ export function normalizeBaseURL(input: string): string {
 }
 
 /**
+ * True when a normalised base names no host. `/api/warehouse` normalises to
+ * `https:///api/warehouse`, which the URL parser reads as the host `api`: a
+ * path is not a base, so it is refused, as is any other base with an empty
+ * authority (`https:///x`).
+ */
+function hostless(normalized: string): boolean {
+  const authority = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(normalized)?.[1] ?? "";
+  return authority.replace(/^.*@/, "") === "";
+}
+
+/**
+ * Throw a `TypeError` for a base that names no host. Run at client
+ * construction; other unusable bases still fail on the first call, as before.
+ *
+ * @internal
+ */
+export function assertBaseHasHost(base: string): void {
+  if (hostless(normalizeBaseURL(base))) throw new TypeError(unusableBase(base));
+}
+
+function unusableBase(base: string): string {
+  return `baseURL ${JSON.stringify(base)} is not a usable URL: give a host, with an optional scheme, port and path prefix, such as "https://example.com/api". A bare path such as "/api" is not one; it names no host`;
+}
+
+/**
  * Resolve an SDK request path against the configured `baseURL`.
  *
  * The single URL-construction rule for every transport (REST in `http.ts`, SSE
@@ -52,11 +77,11 @@ export function normalizeBaseURL(input: string): string {
 export function resolveURL(base: string, path: string, params?: Record<string, string>): URL {
   let root: URL;
   try {
-    root = new URL(normalizeBaseURL(base));
+    const normalized = normalizeBaseURL(base);
+    if (hostless(normalized)) throw new Error("no host");
+    root = new URL(normalized);
   } catch {
-    throw new TypeError(
-      `baseURL ${JSON.stringify(base)} is not a usable URL: give a host, with an optional scheme, port and path prefix, such as "https://example.com/api"`,
-    );
+    throw new TypeError(unusableBase(base));
   }
   // Normalize the base to a directory: a bare last segment (or a query/fragment
   // shadowing one) makes relative resolution *replace* the prefix, not extend it.

@@ -113,7 +113,10 @@ describe("normalizeBaseURL", () => {
     );
   });
 
-  it.each(["", "   ", "https://"])("rejects %j with a message naming the requirement", (input) => {
-    expect(() => resolveURL(input, "/v1/query")).toThrow(/baseURL .* is not a usable URL/);
-  });
+  it.each(["", "   ", "https://", "/api", "/api/warehouse", "//", "/", "https:///x"])(
+    "rejects %j with a message naming the requirement",
+    (input) => {
+      expect(() => resolveURL(input, "/v1/query")).toThrow(/baseURL .* is not a usable URL/);
+    },
+  );
 });

@@ -59,6 +59,13 @@ describe("createClient", () => {
     },
   );
 
+  it.each(["/api/warehouse", "/", "https:///x"])(
+    "rejects the host-less baseURL %j at construction",
+    (baseURL) => {
+      expect(() => createClient({ baseURL })).toThrow(/baseURL .* is not a usable URL/);
+    },
+  );
+
   it("accepts maxRetries 0", () => {
     const client = createClient({ baseURL: "http://localhost:8080", options: { maxRetries: 0 } });
     expect(client._ctx.options.maxRetries).toBe(0);

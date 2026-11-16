@@ -19,6 +19,7 @@ import type {
   StreamOptions,
   VersionInfo,
 } from "./types.js";
+import { assertBaseHasHost } from "./url.js";
 
 type TableName<DB> = DB extends Database ? Extract<keyof DB, string> : string;
 type RowType<DB, T extends string> = DB extends Database
@@ -50,6 +51,9 @@ export class WaveHouseClient<DB extends Database = Database> {
         `baseURL ${JSON.stringify(config.baseURL)} must not carry a query string or fragment: give the origin and an optional path prefix, such as "https://example.com/api"`,
       );
     }
+    // Refused here, not on the first call: a base that names no host (a bare
+    // path such as "/api") would otherwise read as one.
+    assertBaseHasHost(config.baseURL);
     // A negative or fractional count would make the retry loop run zero times.
     const maxRetries = config.options?.maxRetries;
     if (maxRetries !== undefined && (!Number.isInteger(maxRetries) || maxRetries < 0)) {
