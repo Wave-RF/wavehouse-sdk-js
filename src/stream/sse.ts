@@ -73,12 +73,28 @@ function releaseBody(res: Response): void {
   if (res.body && !res.body.locked) res.body.cancel().catch(() => {});
 }
 
+/**
+ * Milliseconds a `Retry-After` header asks for, clamped to `MAX_BACKOFF_MS` so a
+ * hostile or fat-fingered value can't strand a stream. Both header forms are
+ * read (delta-seconds and an HTTP-date); anything else, or a date already
+ * past, is no request at all.
+ */
+function parseRetryAfter(value: string | null): number | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  const ms = /^\d+$/.test(v) ? Number(v) * 1000 : Date.parse(v) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return Math.min(ms, MAX_BACKOFF_MS);
+}
+
 /** Outcome of one connection attempt, driving the reconnect decision. */
 interface AttemptResult {
   /** Milliseconds the connection stayed readable; 0 if it never opened. */
   liveMs: number;
   /** Stop for good: a bad token or missing table can't be fixed by retrying. */
   terminal: boolean;
+  /** Floor for the wait before the next attempt, from the response's `Retry-After`. */
+  retryAfterMs?: number;
 }
 
 /**
@@ -226,7 +242,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     let attempt = 0;
 
     while (!this._closed) {
-      const { liveMs, terminal } = await this._attempt();
+      const { liveMs, terminal, retryAfterMs } = await this._attempt();
 
       if (this._closed) return;
       if (terminal) {
@@ -242,7 +258,8 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       if (liveMs >= STABLE_CONNECTION_MS) attempt = 0;
 
       this._emitStatus("reconnecting");
-      await this._sleep(backoff(attempt, this._retryFloorMs));
+      // A `Retry-After` is a floor for this wait only; a `retry:` field persists.
+      await this._sleep(backoff(attempt, Math.max(this._retryFloorMs, retryAfterMs ?? 0)));
       attempt++;
     }
   }
@@ -343,14 +360,22 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     if (!res.ok) {
       const error = await parseErrorResponse(res);
+      // 429 is a retry-later status from a fronting rate limiter, so a stream
+      // that took one must re-dial rather than stay dead until a reload — unless
+      // the body says otherwise. Every other 4xx stays terminal.
+      if (
+        res.status === 429 &&
+        (error.details as { retryable?: unknown } | undefined)?.retryable !== false
+      ) {
+        error.retryable = true;
+      }
       this._emitError(error);
       // 4xx is terminal: whatever rejected this usually won't be talked round
       // by repeating the request, and native EventSource likewise stops on
-      // non-200. The exception is a 429/408 from a fronting rate limiter, which
-      // is transient even though the stream still ends (#469). Note WaveHouse
-      // doesn't reject here *for authentication* — the endpoint is ungated and
-      // answers a bad token with a reduced view, which is why `auth` is re-read
-      // per attempt (#239 tracks enforcing expiry). The 4xx it raises itself are
+      // non-200. Note WaveHouse doesn't reject here *for authentication* — the
+      // endpoint is ungated and answers a bad token with a reduced view, which
+      // is why `auth` is re-read per attempt (#239 tracks enforcing expiry). The
+      // 4xx it raises itself are
       // a 400 for a missing or empty `table` (internal/api/stream.go) or a
       // malformed `X-Tenant-ID`, and a 404 `unknown tenant` for a tenant it does
       // not serve (internal/api/tenant.go) — never held, or removed, which is
@@ -358,7 +383,12 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       // rejected tenant's 503 is retried like any 5xx. Any other 404/405 means
       // the request missed the route entirely (router.go's chi handlers), and
       // anything else comes from something in front — a gateway, or a proxy.
-      return { liveMs: 0, terminal: !error.retryable };
+      const retry = error.retryable;
+      return {
+        liveMs: 0,
+        terminal: !retry,
+        retryAfterMs: retry ? parseRetryAfter(res.headers.get("Retry-After")) : undefined,
+      };
     }
 
     // A 200 that isn't an event stream is an intermediary answering for the

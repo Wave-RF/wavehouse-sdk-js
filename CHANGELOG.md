@@ -10,5 +10,6 @@
 - A subscriber that throws no longer stops delivery to the others. Each `next`, `status` and `error` callback is isolated and its throw is logged, so a `for await` still receives the event and still ends on `closed`; a throwing `status` handler no longer escapes `.subscribe()` or `.liveQuery()`; and a throwing `initial()` or `next()` during the live-query backfill no longer discards the remaining buffered events, which are also delivered when the backfill fetch fails. Fixes #28.
 - A subscriber that registers after a stream ended on a terminal error now receives that error, so it learns why the stream closed rather than only that it did. Fixes #36.
 - A retried request no longer leaves an abort listener on the caller's `AbortSignal` each time its backoff timer wins, which tripped Node's `MaxListenersExceededWarning` on a signal shared across many requests. Fixes #29.
+- A stream that takes a `429 Too Many Requests` now re-dials instead of staying dead until a reload (unless the body says `retryable: false`); every other 4xx still ends it. A `Retry-After` on a retryable stream response, in seconds or as an HTTP-date, sets the floor for that wait, clamped to 30 s. Fixes #25 and the stream half of #43.
 
 Releases up to 0.2.0 are recorded in the [WaveHouse changelog](https://github.com/Wave-RF/WaveHouse/blob/main/CHANGELOG.md).

@@ -862,6 +862,117 @@ describe("SSETransport reconnect and resumption", () => {
     t.disconnect();
   });
 
+  describe("429 and Retry-After", () => {
+    /** Run one rejected attempt and return how many attempts exist after `ms`. */
+    async function attemptsAfter(res: () => Response, waits: number[]) {
+      const f = makeFetch();
+      f.queue.push(res);
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      // `waitFor` above already advanced the fake clock a little, so every
+      // boundary below keeps a second's margin either side of the deadline.
+      const counts: number[] = [];
+      const statuses = [...seen.statuses];
+      for (const w of waits) {
+        await vi.advanceTimersByTimeAsync(w);
+        counts.push(f.attempts.length);
+      }
+      statuses.push(...seen.statuses.slice(statuses.length));
+      t.disconnect();
+      return { counts, seen: { ...seen, statuses } };
+    }
+
+    it("retries a 429 instead of ending the stream", async () => {
+      const { counts, seen } = await attemptsAfter(
+        () => new Response("{}", { status: 429 }),
+        [2000],
+      );
+      expect(seen.errors[0].status).toBe(429);
+      expect(seen.errors[0].retryable).toBe(true);
+      expect(seen.statuses).not.toContain("closed");
+      expect(counts[0]).toBe(2);
+    });
+
+    it("keeps a 429 terminal when the body says it is not retryable", async () => {
+      const { counts, seen } = await attemptsAfter(
+        () => new Response(JSON.stringify({ retryable: false }), { status: 429 }),
+        [60_000],
+      );
+      expect(seen.errors[0].retryable).toBe(false);
+      expect(counts[0]).toBe(1);
+    });
+
+    it.each([400, 401, 403, 404, 405, 408, 410, 413])("keeps a %i terminal", async (status) => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status, headers: { "Retry-After": "1" } }),
+        [60_000],
+      );
+      expect(counts[0]).toBe(1);
+    });
+
+    it("waits Retry-After seconds before re-dialing a 429", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": "20" } }),
+        [19_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("waits Retry-After on a 503 too", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 503, headers: { "Retry-After": "12" } }),
+        [11_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("reads Retry-After as an HTTP-date", async () => {
+      vi.setSystemTime(new Date("2026-08-01T00:00:00.000Z"));
+      const { counts } = await attemptsAfter(
+        () =>
+          new Response("{}", {
+            status: 429,
+            headers: { "Retry-After": new Date("2026-08-01T00:00:15Z").toUTCString() },
+          }),
+        [14_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("clamps an enormous Retry-After to the 30s ceiling", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": "86400" } }),
+        [29_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it.each(["soon", "-5", "0", ""])("ignores an unusable Retry-After %j", async (value) => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": value } }),
+        [1000, 1000],
+      );
+      expect(counts[1]).toBe(2);
+    });
+
+    it("applies Retry-After to one wait only", async () => {
+      const f = makeFetch();
+      f.queue.push(() => new Response("{}", { status: 429, headers: { "Retry-After": "20" } }));
+      f.queue.push(() => new Response("{}", { status: 429 }));
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      collect(t);
+      t.connect();
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      // The second wait is the schedule's own (attempt 1: at most 2s), not 20s.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.attempts).toHaveLength(3);
+      t.disconnect();
+    });
+  });
+
   it("retries when the connection itself fails", async () => {
     const f = makeFetch();
     f.queue.push(() => {
