@@ -117,12 +117,14 @@ while (result.hasMore && result.next) {
 ### Tenants and server version
 
 ```ts
-// A multi-tenant server: data routes send X-Tenant-ID, admin routes ?tenant=.
-const acme = createClient({ baseURL: '...', options: { tenant: 'acme' } });
-const beta = acme.withTenant('beta'); // a copy for another tenant
+// A multi-tenant server: the SDK has no tenant option. Send X-Tenant-ID
+// yourself through the custom-header hook; it reaches every call and the stream.
+const acme = createClient({ baseURL: '...', options: { headers: { 'X-Tenant-ID': 'acme' } } });
 
 const { data: build } = await acme.version(); // GET /version: { version, git_commit, build_time, go_version }
 ```
+
+Admin calls (`/v1/ops/*`) ignore the header and take a per-call `opts.tenant`, sent as `?tenant=`.
 
 ## Type Safety
 

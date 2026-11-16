@@ -17,6 +17,8 @@ interface WireCase {
   endpoint: string;
   table?: string;
   tenant?: string;
+  /** Request headers set through `options.headers`. */
+  headers?: Record<string, string>;
   operations?: { method: string; args?: unknown[] }[];
   pipe_name?: string;
   pipe_params?: Record<string, unknown> | null;
@@ -75,14 +77,12 @@ async function run(tc: WireCase): Promise<Seen[]> {
       headers: { "Content-Type": "application/json" },
     });
   };
-  // The data routes take the tenant from the client; the admin routes' cases
-  // pass it per call, which also pins that a call-level tenant is honored.
-  const dataTenant = ["query", "ingest", "pipe", "health", "version"].includes(tc.endpoint);
   const wh = createClient({
     baseURL: "http://wavehouse.test",
-    options: { fetch, maxRetries: 0, tenant: dataTenant ? tc.tenant : undefined },
+    options: { fetch, maxRetries: 0, headers: tc.headers },
   });
   const ops = tc.operations ?? [];
+  // A per-call tenant is the admin routes' `?tenant=`.
   const opts = tc.tenant === undefined ? undefined : { tenant: tc.tenant };
 
   switch (tc.endpoint) {

@@ -159,6 +159,21 @@ describe("SSETransport request construction", () => {
     t.disconnect();
   });
 
+  it("sends a caller's X-Tenant-ID header unchanged", async () => {
+    const f = makeFetch();
+    const t = new SSETransport({
+      baseURL: BASE,
+      table: "clicks",
+      headers: { "X-Tenant-ID": "acme" },
+      fetch: f.impl,
+    });
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    expect(headersOf(f.attempts[0])["X-Tenant-ID"]).toBe("acme");
+    expect(new URL(f.attempts[0].url).searchParams.has("tenant")).toBe(false);
+    t.disconnect();
+  });
+
   it("refuses redirects once a credential is attached", async () => {
     const f = makeFetch();
     const t = new SSETransport({

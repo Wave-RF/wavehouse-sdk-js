@@ -38,14 +38,17 @@ describe("version", () => {
   });
 });
 
-describe("tenant", () => {
+describe("X-Tenant-ID header", () => {
+  const withTenant = (id: string) => newClient({ "X-Tenant-ID": id });
+
   // "0" is the default tenant, the one every server has.
-  it("serves a data route and an admin route for the default tenant", async () => {
-    const scoped = wh.withTenant("0");
-    expect((await scoped.sys.health()).error).toBeNull();
-    const res = await scoped.schema.list();
-    expect(res.error).toBeNull();
-    expect(Object.keys(res.data ?? {})).toContain("e2e_events");
+  it("serves a data route for the default tenant", async () => {
+    expect((await withTenant("0").sys.health()).error).toBeNull();
+  });
+
+  it("answers an unknown tenant on a data route with 404", async () => {
+    const res = await withTenant("nope").sys.health();
+    expect(res.error?.status).toBe(404);
   });
 });
 

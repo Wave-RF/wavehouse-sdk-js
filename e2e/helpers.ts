@@ -2,12 +2,12 @@ import { inject } from "vitest";
 import { createClient, type StreamController, type StreamEvent } from "../src/index.js";
 
 /** A client authenticated as the admin role, with one retry. */
-export function newClient() {
+export function newClient(headers?: Record<string, string>) {
   const token = inject("adminToken");
   return createClient({
     baseURL: inject("serverUrl"),
     auth: () => token,
-    options: { maxRetries: 1 },
+    options: { maxRetries: 1, headers },
   });
 }
 

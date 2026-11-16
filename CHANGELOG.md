@@ -5,7 +5,7 @@
 ### Added
 
 - `wh.version()` returns the server's build (`version`, `git_commit`, `build_time`, `go_version`) from `GET /version`, as `wavehouse-sdk-go`'s `Version` does.
-- `options.tenant` and `wh.withTenant(id)` scope a client to one tenant. Data routes send `X-Tenant-ID`; admin routes (`/v1/ops/*`) send `?tenant=`, where a per-call `opts.tenant` still wins; `/version` sends neither. An empty id sends nothing.
+- Documented: a multi-tenant deployment sets `options.headers: { "X-Tenant-ID": "acme" }`, which reaches every REST call and the stream unchanged. The shared conformance cases gain an optional `"headers"` map for it.
 
 ### Changed
 

@@ -51,7 +51,6 @@ export class WaveHouseClient<DB extends Database = Database> {
     }
     this._ctx = {
       baseURL: config.baseURL.replace(/\/+$/, ""),
-      tenant: config.options?.tenant || undefined,
       auth: config.auth,
       options: {
         maxRetries: config.options?.maxRetries ?? 2,
@@ -70,21 +69,7 @@ export class WaveHouseClient<DB extends Database = Database> {
   }
 
   /**
-   * A copy of this client scoped to tenant `id`, with the same connection
-   * settings. An empty id addresses the default tenant. See `options.tenant`
-   * for how the tenant is sent.
-   */
-  withTenant(id: string): WaveHouseClient<DB> {
-    return new WaveHouseClient<DB>({
-      baseURL: this._ctx.baseURL,
-      auth: this._ctx.auth,
-      options: { ...this._ctx.options, tenant: id },
-    });
-  }
-
-  /**
-   * The server's build metadata, from `GET /version`. Needs no tenant and sends
-   * none.
+   * The server's build metadata, from `GET /version`. Needs no tenant.
    */
   async version(opts?: { signal?: AbortSignal }): Promise<Result<VersionInfo>> {
     const { data, error } = await request<VersionInfo>(this._ctx, {
@@ -150,7 +135,6 @@ export class WaveHouseClient<DB extends Database = Database> {
       auth: this._ctx.auth,
       fetch: this._ctx.options.fetch,
       headers: this._ctx.options.headers,
-      tenant: this._ctx.tenant,
       fetchOptions: this._ctx.options.fetchOptions,
     });
     const controller = new StreamController<T>(transport);

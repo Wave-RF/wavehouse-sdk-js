@@ -135,15 +135,6 @@ export interface ClientConfig<_DB extends Database = Database> {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface ClientOptions {
-  /**
-   * Scope the client to one tenant of a multi-tenant server. Data routes
-   * (`/v1/ingest`, `/v1/query`, `/v1/pipes/*`, `/v1/stream`, `/v1/health`) send
-   * it as `X-Tenant-ID`; admin routes (`/v1/ops/*`) send it as `?tenant=`,
-   * unless the call passes its own `opts.tenant`. `GET /version` sends neither.
-   * Empty or omitted sends nothing, which the server reads as the default
-   * tenant. `wh.withTenant(id)` derives a client for another tenant.
-   */
-  tenant?: string;
   /** Maximum retry attempts for failed requests. Default: 2. */
   maxRetries?: number;
   /**
@@ -194,6 +185,11 @@ export interface ClientOptions {
    * `Content-Type` and `Accept` a given request needs are not overridable
    * here — a global `Content-Type` that outranked the request's own is a
    * documented way to break uploads.
+   *
+   * This is also how a multi-tenant deployment selects its tenant: the SDK has
+   * no tenant option, so pass `{ "X-Tenant-ID": "acme" }`, sent unchanged on
+   * every REST call and on the stream. (The admin routes ignore it; they take
+   * a per-call `opts.tenant` as `?tenant=`.)
    *
    * In a browser these are subject to CORS: a header outside the safelist adds
    * it to the preflight, which the origin must allow. WaveHouse's own CORS
@@ -537,8 +533,6 @@ export interface StreamOptions {
 /** @internal */
 export interface HttpContext {
   baseURL: string;
-  /** The client's tenant; empty or absent sends none. */
-  tenant?: string;
   auth?: () => Promise<string> | string;
   // `fetch` stays optional rather than defaulted here, to keep the global late-bound.
   options: {

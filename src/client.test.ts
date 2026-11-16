@@ -383,52 +383,40 @@ describe("stream error delivery", () => {
   });
 });
 
-describe("tenant", () => {
+describe("X-Tenant-ID through options.headers", () => {
+  // The SDK has no tenant option: selecting one is the caller's header, sent
+  // unchanged on every call. Per-call `opts.tenant` on admin routes is separate.
   const calls: { url: URL; headers: Record<string, string> }[] = [];
   const fetchStub: FetchLike = async (url, init) => {
     calls.push({ url: new URL(url), headers: (init?.headers ?? {}) as Record<string, string> });
     return new Response("[]", { status: 200 });
   };
-  const make = (tenant?: string) =>
-    createClient({
-      baseURL: "http://wavehouse.test",
-      options: { fetch: fetchStub, maxRetries: 0, tenant },
-    });
   beforeEach(() => {
     calls.length = 0;
   });
 
-  it("sends X-Tenant-ID on data routes and ?tenant= on admin routes", async () => {
-    const wh = make("acme");
+  it("reaches data and admin routes unchanged", async () => {
+    const wh = createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: fetchStub, maxRetries: 0, headers: { "X-Tenant-ID": "acme" } },
+    });
     await wh.sys.health();
     await wh.pipes.list();
-    expect(calls[0].headers["X-Tenant-ID"]).toBe("acme");
-    expect(calls[0].url.searchParams.has("tenant")).toBe(false);
-    expect(calls[1].headers["X-Tenant-ID"]).toBeUndefined();
-    expect(calls[1].url.searchParams.get("tenant")).toBe("acme");
+    await wh.from("clicks").select("*").limit(1);
+    expect(calls).toHaveLength(3);
+    for (const c of calls) {
+      expect(c.headers["X-Tenant-ID"]).toBe("acme");
+      expect(c.url.searchParams.has("tenant")).toBe(false);
+    }
   });
 
-  it("lets a per-call tenant win on admin routes", async () => {
-    await make("acme").pipes.list({ tenant: "other" });
-    expect(calls[0].url.searchParams.getAll("tenant")).toEqual(["other"]);
-  });
-
-  it("sends nothing without a tenant, and none on /version", async () => {
-    await make().sys.health();
-    await make("acme").version();
+  it("is not added when the caller sets none", async () => {
+    const wh = createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: fetchStub, maxRetries: 0 },
+    });
+    await wh.sys.health();
     expect(calls[0].headers["X-Tenant-ID"]).toBeUndefined();
-    expect(calls[1].url.pathname).toBe("/version");
-    expect(calls[1].headers["X-Tenant-ID"]).toBeUndefined();
-    expect(calls[1].url.search).toBe("");
-  });
-
-  it("withTenant returns a rescoped copy and leaves the original alone", async () => {
-    const base = make("acme");
-    const other = base.withTenant("beta");
-    await other.sys.health();
-    await base.sys.health();
-    expect(calls[0].headers["X-Tenant-ID"]).toBe("beta");
-    expect(calls[1].headers["X-Tenant-ID"]).toBe("acme");
   });
 });
 
