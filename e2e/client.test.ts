@@ -221,7 +221,8 @@ describe("stream", () => {
     });
 
     const name = uniqueName("early-reconnect");
-    const stream = dropping.from("e2e_events").stream();
+    // Filtered by name: the resume replays earlier tests' rows too.
+    const stream = dropping.from("e2e_events").selectAll().where("name", "=", name).stream();
     const { done } = collect(stream, 1);
     try {
       await stream.connected();
