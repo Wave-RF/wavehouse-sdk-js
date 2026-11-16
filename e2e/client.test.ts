@@ -1,0 +1,184 @@
+import { describe, expect, it } from "vitest";
+import { collect, eventRow, eventually, newClient, uniqueName } from "./helpers.js";
+
+const wh = newClient();
+
+type Row = { event_id: string; name: string; value: number; ts: string };
+
+/** Waits until `want` rows named `name` are queryable, ordered by value. */
+async function rowsNamed(name: string, want: number) {
+  return eventually(async () => {
+    const res = await wh
+      .from("e2e_events")
+      .selectAll()
+      .where("name", "=", name)
+      .orderBy("value", "asc")
+      .limit(100);
+    expect(res.error).toBeNull();
+    expect(res.data).toHaveLength(want);
+    return res.data as Row[];
+  });
+}
+
+describe("health", () => {
+  it("reports the server healthy", async () => {
+    const res = await wh.sys.health();
+    expect(res.error).toBeNull();
+    expect(res.ok).toBe(true);
+  });
+});
+
+describe("schema", () => {
+  it("lists the fixture table", async () => {
+    const res = await wh.schema.list();
+    expect(res.error).toBeNull();
+    expect(Object.keys(res.data ?? {})).toContain("e2e_events");
+  });
+
+  it("describes its columns", async () => {
+    const res = await wh.from("e2e_events").schema();
+    expect(res.error).toBeNull();
+    const cols = res.data!.columns;
+    expect(cols.map((c) => c.name)).toEqual(["event_id", "name", "value", "ts"]);
+    expect(cols.map((c) => c.position)).toEqual([1, 2, 3, 4]);
+    expect(cols.find((c) => c.name === "ts")?.default_kind).toBe("DEFAULT");
+  });
+});
+
+describe("insert", () => {
+  it("inserts one row", async () => {
+    const name = uniqueName("one");
+    const res = await wh.from("e2e_events").insert(eventRow(name, 1));
+    expect(res.error).toBeNull();
+    expect(res.data?.ok).toBe(true);
+
+    const rows = await rowsNamed(name, 1);
+    expect(rows[0].value).toBe(1);
+  });
+
+  it("inserts a batch and reports each record", async () => {
+    const name = uniqueName("batch");
+    const res = await wh
+      .from("e2e_events")
+      .insert([eventRow(name, 1), eventRow(name, 2), eventRow(name, 3)]);
+    expect(res.error).toBeNull();
+    expect(res.data).toMatchObject({ ok: true, total: 3, succeeded: 3, failed: 0, duplicates: 0 });
+
+    const rows = await rowsNamed(name, 3);
+    expect(rows.map((r) => r.value)).toEqual([1, 2, 3]);
+  });
+
+  it("flags a repeated dedupe id as a duplicate", async () => {
+    const row = eventRow(uniqueName("dup"), 1);
+    const first = await wh.from("e2e_events").insert(row);
+    expect(first.error).toBeNull();
+    expect(first.data?.duplicate).toBeFalsy();
+
+    const second = await wh.from("e2e_events").insert(row);
+    expect(second.error).toBeNull();
+    expect(second.data?.duplicate).toBe(true);
+  });
+});
+
+describe("query", () => {
+  const name = uniqueName("query");
+
+  it("projects and orders", async () => {
+    const seeded = await wh.from("e2e_events").insert([eventRow(name, 10), eventRow(name, 20)]);
+    expect(seeded.error).toBeNull();
+    await rowsNamed(name, 2);
+
+    const res = await wh
+      .from("e2e_events")
+      .select("name", "value")
+      .where("name", "=", name)
+      .orderBy("value", "desc")
+      .limit(5);
+    expect(res.error).toBeNull();
+    expect(res.data).toHaveLength(2);
+    expect(res.data?.[0]).toEqual({ name, value: 20 });
+  });
+
+  it("aggregates", async () => {
+    const res = await wh.from("e2e_events").select().sum("value", "total").where("name", "=", name);
+    expect(res.error).toBeNull();
+    expect(res.data).toHaveLength(1);
+    expect(res.data?.[0]).toMatchObject({ total: 30 });
+  });
+});
+
+describe("sql", () => {
+  it("runs raw SQL as admin", async () => {
+    const res = await wh.sql("SELECT 1 AS n");
+    expect(res.error).toBeNull();
+    expect(res.data).toEqual([{ n: 1 }]);
+  });
+});
+
+describe("pipes", () => {
+  it("lists and describes a pipe", async () => {
+    const list = await wh.pipes.list();
+    expect(list.error).toBeNull();
+    expect(list.data?.map((p) => p.name)).toContain("e2e_count");
+
+    const one = await wh.pipes.get("e2e_count");
+    expect(one.error).toBeNull();
+    expect(one.data?.sql).toContain("count()");
+  });
+
+  it("executes a pipe", async () => {
+    const name = uniqueName("pipe");
+    const seeded = await wh.from("e2e_events").insert([eventRow(name, 1), eventRow(name, 2)]);
+    expect(seeded.error).toBeNull();
+    await rowsNamed(name, 2);
+
+    const res = await wh.pipe("e2e_count", { name });
+    expect(res.error).toBeNull();
+    expect(res.data).toHaveLength(1);
+    expect(res.data?.[0]).toMatchObject({ n: 2 });
+  });
+});
+
+describe("stream", () => {
+  it("delivers inserted rows with named fields", async () => {
+    const name = uniqueName("stream");
+    const stream = wh.from("e2e_events").stream();
+    const { done } = collect(stream, 2);
+    try {
+      await stream.connected();
+      expect(stream.status).toBe("live");
+
+      const res = await wh.from("e2e_events").insert([eventRow(name, 1), eventRow(name, 2)]);
+      expect(res.error).toBeNull();
+
+      const events = (await done).filter((e) => (e.data as Row).name === name);
+      expect(events).toHaveLength(2);
+      for (const e of events) expect(e.table).toBe("e2e_events");
+      const byValue = events.map((e) => e.data as Row).sort((a, b) => a.value - b.value);
+      expect(byValue.map((r) => r.value)).toEqual([1, 2]);
+      expect(byValue[0].event_id).toMatch(new RegExp(`^${name}-`));
+    } finally {
+      stream.close();
+    }
+  });
+
+  it("delivers only rows matching a where filter", async () => {
+    const want = uniqueName("match");
+    const other = uniqueName("other");
+    const stream = wh.from("e2e_events").selectAll().where("name", "=", want).stream();
+    const { events, done } = collect(stream, 1);
+    try {
+      await stream.connected();
+      // The non-matching row goes first, so a leaked filter would arrive before the match.
+      await wh.from("e2e_events").insert(eventRow(other, 1));
+      await wh.from("e2e_events").insert(eventRow(want, 2));
+
+      await done;
+      // Give a late non-matching event a moment to show up before asserting its absence.
+      await new Promise((r) => setTimeout(r, 500));
+      expect(events.map((e) => (e.data as Row).name)).toEqual([want]);
+    } finally {
+      stream.close();
+    }
+  });
+});

@@ -22,7 +22,9 @@ The package has one runtime dependency, `eventsource-parser`, and keeps it that 
 
 ## Tests
 
-Two layers exist today: unit tests (`pnpm test`, HTTP mocked, gated at a 40% statement floor) and the built-package smoke check (`make smoke`), which loads the ESM, CJS and IIFE builds and the bin at the oldest Node `engines.node` admits and type-checks a CommonJS and an ESM consumer. Request conformance tests and live tests against a real server do not exist yet; don't describe a mocked test as covering them.
+Three layers exist today: unit tests (`pnpm test`, HTTP mocked, gated at a 40% statement floor), the built-package smoke check (`make smoke`), which loads the ESM, CJS and IIFE builds and the bin at the oldest Node `engines.node` admits and type-checks a CommonJS and an ESM consumer, and live tests (`make test-e2e`). Request conformance tests and server end-to-end tests do not exist yet; don't describe a mocked test as covering them.
+
+The live tests are in `e2e/`, with their own `vitest.e2e.config.ts`, and need Docker. A `globalSetup` starts ClickHouse and the server's rolling `:dev` image (always pulled) with `testcontainers`, using the settings in `e2e/testdata/settings/`, and creates the `e2e_events` fixture table straight through the server's admin endpoints so a broken SDK fails its own tests rather than setup. `WAVEHOUSE_IMAGE` overrides the server image; `WAVEHOUSE_URL` with `WAVEHOUSE_ADMIN_TOKEN` (an admin-role JWT) skips the containers and uses a running server. CI runs them as the `Live tests` job. They are not part of `make ci`. Live queries (`liveQuery`) are not covered yet.
 
 ## Releases
 
