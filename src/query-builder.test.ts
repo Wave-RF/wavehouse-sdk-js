@@ -396,6 +396,10 @@ describe("QueryBuilder", () => {
     expect(received[0].page).toBe("/home");
   });
 
+  it("offers no cacheTTL(): the server picks the cache TTL, so a setter could only mislead", () => {
+    expect("cacheTTL" in builder()).toBe(false);
+  });
+
   // --- Complex chain ---
 
   it("builds a complex query", async () => {
@@ -407,7 +411,6 @@ describe("QueryBuilder", () => {
       .orderBy("total", "desc")
       .limit(50)
       .timeRange("received_timestamp", "1h")
-      .cacheTTL(60)
       .fetch();
 
     const body = JSON.parse(fetchSpy.mock.calls[0][1].body);

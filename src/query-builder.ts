@@ -40,7 +40,6 @@ interface QueryState {
   orderBy: OrderClause[];
   limit?: number;
   timeRange?: TimeRange;
-  cacheTTL?: number;
 }
 
 type CreateStreamFn<Row> = (table: string, opts?: StreamOptions) => StreamController<Row>;
@@ -126,10 +125,6 @@ export class QueryBuilder<Row = Record<string, unknown>> implements PromiseLike<
 
   timeRange(column: string, since: string, until?: string): QueryBuilder<Row> {
     return this._clone({ timeRange: { column, since, until } });
-  }
-
-  cacheTTL(seconds: number): QueryBuilder<Row> {
-    return this._clone({ cacheTTL: seconds });
   }
 
   // --- Execution ---

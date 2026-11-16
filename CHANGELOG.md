@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed `QueryBuilder.cacheTTL()`. It stored a value that was never sent, and the query wire type has no TTL field: the server picks the result-cache TTL itself. Delete the call; behaviour is unchanged. Fixes #45.
+
 ### Deprecated
 
 - `wavehouse-codegen --auth <token>`: an argument is visible in the process list and shell history. It still works and now prints a warning. Pass the token in `WAVEHOUSE_ADMIN_TOKEN` or on stdin with the new `--auth-stdin`; `WAVEHOUSE_OPERATOR_KEY` likewise supplies the operator key. Fixes #38.
