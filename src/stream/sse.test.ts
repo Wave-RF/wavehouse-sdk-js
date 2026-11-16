@@ -792,6 +792,52 @@ describe("SSETransport reconnect and resumption", () => {
     t.disconnect();
   });
 
+  it("backs off across repeated overflows even when each connection ran past the stable window", async () => {
+    const f = makeFetch();
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const third = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+      () => third.res,
+    );
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+
+    // Held long enough to count as healthy, then overflows: the first wait is
+    // the schedule's first step (500-1000ms)...
+    await vi.advanceTimersByTimeAsync(4000);
+    first.push(`data: ${"x".repeat(MAX_BUFFER_CHARS)}`);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.attempts).toHaveLength(2);
+
+    // ...and the second must not start over: it is the next step (1000-2000ms).
+    await vi.advanceTimersByTimeAsync(4000);
+    second.push(`data: ${"x".repeat(MAX_BUFFER_CHARS)}`);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(f.attempts).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(f.attempts).toHaveLength(3);
+    t.disconnect();
+  });
+
+  it("does not open a connection when disconnect() lands while a signal-ignoring fetch resolves", async () => {
+    let release!: (r: Response) => void;
+    const body = streamingResponse();
+    const impl: FetchLike = () => new Promise<Response>((r) => (release = r));
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    t.disconnect();
+    release(body.res);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(seen.statuses).toEqual(["closed"]);
+  });
+
   it("retries an AbortError from a custom fetch that the SDK did not raise", async () => {
     const f = makeFetch();
     // The motivating case: an `options.fetch` enforcing its own per-attempt

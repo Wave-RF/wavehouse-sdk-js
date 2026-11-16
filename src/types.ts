@@ -108,6 +108,11 @@ export interface ClientConfig<_DB extends Database = Database> {
  * other than a `DOMException` named `AbortError` — `AbortSignal.timeout()`,
  * `node-fetch` — is reported the same way.
  *
+ * **Honor `init.signal`.** The SDK aborts it to cancel a call or close a stream,
+ * and relies on the rejection or errored body that follows. An implementation
+ * that ignores the signal keeps a request (and, for a stream, a socket) running
+ * after the caller has let go of it.
+ *
  * **Streaming needs more.** `.stream()` and `.liveQuery()` read the response as
  * it arrives, via `.body.getReader()`, so an implementation used with them must
  * return a response carrying a live `ReadableStream` — something the type cannot

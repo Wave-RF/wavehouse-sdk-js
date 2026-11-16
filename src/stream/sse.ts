@@ -333,6 +333,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       return { liveMs: 0, terminal: false };
     }
 
+    // A fetch that ignores `init.signal` can resolve after `disconnect()`;
+    // don't open a connection nobody wants.
+    if (this._closed) {
+      releaseBody(res);
+      return { liveMs: 0, terminal: true };
+    }
+
     // Redirects are refused, not followed — see `_init`. Surfaced explicitly
     // because both shapes are otherwise misleading: a browser reports an
     // opaque status-0 response, and Node hands back the raw 3xx.
@@ -438,8 +445,12 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     this._emitStatus("live");
     const openedAt = Date.now();
-    await this._pump(body);
-    return { liveMs: Date.now() - openedAt, terminal: false };
+    const overflowed = await this._pump(body);
+    // An overflow ends a connection that was readable but not healthy: counting
+    // it as held would reset the backoff each cycle, and a peer that overflows
+    // every time (a broken intermediary) would be re-dialed at a flat rate,
+    // pulling the whole buffer cap on every pass.
+    return { liveMs: overflowed ? 0 : Date.now() - openedAt, terminal: false };
   }
 
   /** Resolve the stream URL. Throws on a `baseURL` that isn't a usable http(s) origin. */
@@ -551,7 +562,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   }
 
   /** Decode and parse frames until the stream ends, aborts, or errors. */
-  private async _pump(body: ReadableStream<Uint8Array>): Promise<void> {
+  private async _pump(body: ReadableStream<Uint8Array>): Promise<boolean> {
     // Set when the parser reports a buffer overflow: it is terminated at that
     // point, so the read loop must stop rather than feed it again.
     let overflowed = false;
@@ -588,20 +599,21 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) return;
+        if (done) return false;
         parser.feed(decoder.decode(value, { stream: true }));
         // End the connection on the overflow we just reported, instead of
         // feeding a terminated parser and re-reporting it as a read failure.
-        if (overflowed) return;
+        if (overflowed) return true;
       }
     } catch (e) {
-      if (this._closed) return;
+      if (this._closed) return overflowed;
       this._emitError({
         status: 0,
         code: "SSE_READ_ERROR",
         message: e instanceof Error ? e.message : String(e),
         retryable: true,
       });
+      return overflowed;
     } finally {
       reader.cancel().catch(() => {
         // Already torn down — nothing left to release.
