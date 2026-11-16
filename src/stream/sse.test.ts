@@ -447,35 +447,110 @@ describe("SSETransport positional rows", () => {
     t.disconnect();
   });
 
-  it("drops a row it has no column list for rather than guessing", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
+  describe("protocol errors reconnect from the last delivered id", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
 
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
+    /** One connection that delivers a first good row, then `bad`, then a good row it must not deliver. */
+    async function brokenConnection(bad: string) {
+      const f = makeFetch();
+      const first = streamingResponse();
+      const second = streamingResponse();
+      f.queue.push(
+        () => first.res,
+        () => second.res,
+      );
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    conn.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["/a"] }));
-    await flush();
+      first.push(rowFrames("t1", "t1", { page: "/a", country: "US" }));
+      await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+      // The bad frame and a good one in the same chunk: nothing after the bad
+      // one on this connection may be delivered or move the resume point.
+      first.push(
+        bad + frame("t3", { table_name: "clicks", received_timestamp: "t3", row: ["/c", "FR"] }),
+      );
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      return { f, t, seen, second };
+    }
 
-    expect(seen.events).toHaveLength(0);
-    expect(seen.errors).toHaveLength(0);
-    expect(warn).toHaveBeenCalled();
+    it("reconnects on a row with fewer values than announced columns", async () => {
+      const { f, t, seen } = await brokenConnection(
+        frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b"] }),
+      );
+      expect(seen.errors[0]).toMatchObject({ code: "SSE_PROTOCOL_ERROR", retryable: true });
+      expect(seen.errors[0].message).toContain("1 value(s) but 2 column(s)");
+      expect(seen.events).toHaveLength(1);
+      // The refused frame, and the good one behind it, did not move the resume point.
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+      t.disconnect();
+    });
 
-    // The stream keeps going: the announcement arrives and rows flow again.
-    conn.push(schemaFrame(["page"]));
-    conn.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b"] }));
-    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
-    expect(seen.events[0].data).toEqual({ page: "/b" });
+    it("reconnects on a row with more values than announced columns", async () => {
+      const { f, t, seen } = await brokenConnection(
+        frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b", "US", "x"] }),
+      );
+      expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
+      expect(seen.events).toHaveLength(1);
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+      t.disconnect();
+    });
 
-    t.disconnect();
-    warn.mockRestore();
+    it("reconnects on a row that is not an array", async () => {
+      const { f, t, seen } = await brokenConnection(
+        frame("t2", { table_name: "clicks", received_timestamp: "t2", row: "not-an-array" }),
+      );
+      expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+      t.disconnect();
+    });
+
+    it("treats a data frame before any schema frame as a protocol error, even an empty row", async () => {
+      const f = makeFetch();
+      const first = streamingResponse();
+      const second = streamingResponse();
+      f.queue.push(
+        () => first.res,
+        () => second.res,
+      );
+      const t = new SSETransport({
+        baseURL: BASE,
+        table: "clicks",
+        since: "2026-08-01T00:00:00Z",
+        fetch: f.impl,
+      });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.statuses).toContain("live"));
+
+      first.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: [] }));
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      expect(seen.errors[0]).toMatchObject({ code: "SSE_PROTOCOL_ERROR", retryable: true });
+      expect(seen.events).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      // Nothing was delivered, so the reconnect resumes from `since`, not from an id it never had.
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
+      expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:00Z");
+
+      // The new connection announces its columns first, and rows flow again.
+      second.push(rowFrames("t2", "t2", { page: "/b" }));
+      await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+      expect(seen.events[0].data).toEqual({ page: "/b" });
+      t.disconnect();
+    });
   });
 
-  it("drops a row whose length disagrees with the announced columns", async () => {
+  it("bounds warnings per cause instead of one per frame", async () => {
+    // A per-frame warn for a malformed schema frame or unparseable JSON is one
+    // console line per frame for the whole connection. The volume is bounded,
+    // but per CAUSE — a flat boolean would hide whichever fired second.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const f = makeFetch();
     const conn = streamingResponse();
@@ -486,67 +561,15 @@ describe("SSETransport positional rows", () => {
     t.connect();
     await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    conn.push(schemaFrame(["page", "country"]));
-    // Too short and too long are the same class of bug: there is no way to say
-    // which value is which, so neither is delivered under guessed names.
-    conn.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["/a"] }));
-    conn.push(
-      frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/a", "US", "extra"] }),
-    );
-    conn.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: "not-an-array" }));
-    await flush();
-
-    expect(seen.events).toHaveLength(0);
-    expect(warn).toHaveBeenCalledTimes(3);
-    t.disconnect();
-    warn.mockRestore();
-  });
-
-  it("bounds skew warnings per cause instead of one per row", async () => {
-    // A server that predates the positional wire sends every row with no schema
-    // event, so the unbounded warn was one console line per row for the whole
-    // connection. The volume is bounded, but per CAUSE — a flat boolean would
-    // have hidden the short/long/non-array cases behind whichever fired first.
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
-
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
-
-    // No schema frame at all — 10 rows, one cause.
     for (let i = 0; i < 10; i++) {
-      conn.push(frame(`t${i}`, { table_name: "clicks", received_timestamp: `t${i}`, row: ["/a"] }));
+      conn.push(`event: schema\ndata: {"table_name":"clicks","columns":"not-an-array"}\n\n`);
     }
     await flush();
-
-    expect(seen.events).toHaveLength(0);
     // 3 warnings + 1 "further occurrences suppressed", not 10.
     expect(warn).toHaveBeenCalledTimes(4);
     expect(String(warn.mock.calls[3][0])).toContain("suppressed");
 
     // A DIFFERENT cause still gets its own budget — the point of keying by cause.
-    warn.mockClear();
-    conn.push(schemaFrame(["page", "country"]));
-    conn.push(frame("s1", { table_name: "clicks", received_timestamp: "s1", row: ["/a"] }));
-    await flush();
-    expect(warn).toHaveBeenCalledTimes(1);
-
-    // The two non-skew causes are bounded on the same budget. Both flood
-    // identically against a bad server, and sdk/reference.md states the bound as
-    // a contract for every cause — so each needs its own case, or reverting the
-    // bound breaks nothing.
-    warn.mockClear();
-    for (let i = 0; i < 10; i++) {
-      conn.push(`event: schema\ndata: {"table_name":"clicks","columns":"not-an-array"}\n\n`);
-    }
-    await flush();
-    expect(warn).toHaveBeenCalledTimes(4);
-    expect(String(warn.mock.calls[3][0])).toContain("suppressed");
-
     warn.mockClear();
     for (let i = 0; i < 10; i++) {
       conn.push(`data: {not json\n\n`);
@@ -562,29 +585,37 @@ describe("SSETransport positional rows", () => {
   it("refuses a schema frame that names a column twice", async () => {
     // Zipping a positional row against a duplicate name keeps the later value
     // and drops the earlier one, with no signal. Refusing the announcement is
-    // the loud failure: rows drop until the next valid one.
+    // the loud failure: the rows behind it are a protocol error, and the
+    // connection reopens to have the columns announced again.
+    vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
+    const first = streamingResponse();
+    const second = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+    );
 
     const t2 = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
     const seen = collect(t2);
     t2.connect();
     await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    conn.push(schemaFrame(["tenant", "tenant"]));
-    conn.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["a", "b"] }));
-    await flush();
+    first.push(schemaFrame(["tenant", "tenant"]));
+    first.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["a", "b"] }));
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
 
     expect(seen.events).toHaveLength(0);
     expect(warn).toHaveBeenCalled();
+    expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
 
-    // A valid announcement afterwards recovers the stream.
-    conn.push(schemaFrame(["page", "button"]));
-    conn.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/a", "go"] }));
-    await flush();
-    expect(seen.events).toHaveLength(1);
+    // A valid announcement on the new connection recovers the stream.
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    second.push(schemaFrame(["page", "button"]));
+    second.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/a", "go"] }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
     expect(seen.events[0].data).toEqual({ page: "/a", button: "go" });
 
     t2.disconnect();

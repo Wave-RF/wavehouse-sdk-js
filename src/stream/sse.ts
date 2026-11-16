@@ -144,7 +144,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * Column names for the rows currently arriving, from the most recent
    * `event: schema` frame. Rows travel positionally, so this is what turns one
    * back into an object; `null` means none has been announced yet, and a data
-   * frame arriving in that state is unreadable rather than merely unlabeled.
+   * frame arriving in that state is a protocol error (see `_dispatch`).
    *
    * Reset at the start of every connection attempt: a reconnect re-announces,
    * and zipping a new connection's rows under the previous one's list would
@@ -152,16 +152,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    */
   private _columns: string[] | null = null;
   /**
-   * Per-cause warning budget for the current connection. A server that predates
-   * the positional wire sends every row without a schema event, so an unbounded
-   * `console.warn` per row floods the console for the whole connection — and so
-   * does any other per-frame warn against a server sending something the reader
-   * cannot use. Every PER-FRAME warn site is bounded, but keyed by CAUSE so a row
-   * with no announcement, a short row, a long row, a non-array row, a malformed
-   * schema frame and unparseable JSON stay individually visible: collapsing them
-   * behind one flag would hide the distinct failures the warning exists to
-   * surface. Reset per attempt. (The per-connect() notices are not per-frame and
-   * are not bounded here.)
+   * Per-cause warning budget for the current connection. Every PER-FRAME warn
+   * site is bounded, keyed by CAUSE so a malformed schema frame and unparseable
+   * JSON stay individually visible: collapsing them behind one flag would hide
+   * the distinct failures the warning exists to surface, and an unbounded
+   * `console.warn` per frame floods the console for the whole connection. Reset
+   * per attempt. (The per-connect() notices are not per-frame and are not
+   * bounded here.)
    */
   private _warnBudget = new Map<string, number>();
 
@@ -445,11 +442,11 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     this._emitStatus("live");
     const openedAt = Date.now();
-    const overflowed = await this._pump(body);
-    // An overflow ends a connection that was readable but not healthy: counting
-    // it as held would reset the backoff each cycle, and a peer that overflows
-    // every time (a broken intermediary) would be re-dialed at a flat rate,
-    // pulling the whole buffer cap on every pass.
+    const overflowed = await this._pump(body); // true: overflow or protocol error
+    // An overflow or a protocol error ends a connection that was readable but
+    // not healthy: counting it as held would reset the backoff each cycle, and a
+    // peer that does it every time (a broken intermediary) would be re-dialed at
+    // a flat rate.
     return { liveMs: overflowed ? 0 : Date.now() - openedAt, terminal: false };
   }
 
@@ -559,22 +556,45 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     return init;
   }
 
-  /** Decode and parse frames until the stream ends, aborts, or errors. */
+  /**
+   * Decode and parse frames until the stream ends, aborts, or errors. Returns
+   * whether the connection ended unhealthy: a buffer overflow or a protocol error.
+   */
   private async _pump(body: ReadableStream<Uint8Array>): Promise<boolean> {
     // Set when the parser reports a buffer overflow: it is terminated at that
     // point, so the read loop must stop rather than feed it again.
     let overflowed = false;
+    // Set by a protocol error: the rest of the chunk is discarded and the
+    // connection reopened, so no later frame is delivered or advances the id.
+    let broken = false;
     const parser = createParser({
       onEvent: (msg) => {
-        if (msg.id) this._lastEventId = msg.id;
-        if (!msg.data) return;
+        if (broken) return;
+        if (!msg.data) {
+          if (msg.id) this._lastEventId = msg.id;
+          return;
+        }
         // The server announces the column list before the rows that use it,
         // and again whenever it changes mid-stream.
         if (msg.event === "schema") {
+          if (msg.id) this._lastEventId = msg.id;
           this._applySchema(msg.data);
           return;
         }
-        this._dispatch(msg.data);
+        const problem = this._dispatch(msg.data);
+        if (problem !== undefined) {
+          broken = true;
+          this._emitError({
+            status: 0,
+            code: "SSE_PROTOCOL_ERROR",
+            message: problem,
+            retryable: true,
+          });
+          return;
+        }
+        // Only after delivery: a frame that was refused must not move the
+        // resume point past itself, or the reconnect would skip it.
+        if (msg.id) this._lastEventId = msg.id;
       },
       onRetry: (ms) => {
         this._retryFloorMs = Math.min(Math.max(ms, 0), MAX_BACKOFF_MS);
@@ -601,17 +621,18 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
         parser.feed(decoder.decode(value, { stream: true }));
         // End the connection on the overflow we just reported, instead of
         // feeding a terminated parser and re-reporting it as a read failure.
-        if (overflowed) return true;
+        // A protocol error ends it too, to be reopened from the last delivered id.
+        if (overflowed || broken) return true;
       }
     } catch (e) {
-      if (this._closed) return overflowed;
+      if (this._closed) return overflowed || broken;
       this._emitError({
         status: 0,
         code: "SSE_READ_ERROR",
         message: e instanceof Error ? e.message : String(e),
         retryable: true,
       });
-      return overflowed;
+      return overflowed || broken;
     } finally {
       reader.cancel().catch(() => {
         // Already torn down — nothing left to release.
@@ -649,13 +670,16 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   }
 
   /**
-   * Turn one frame's `data` into a StreamEvent.
+   * Turn one frame's `data` into a StreamEvent and deliver it.
    *
    * The row arrives positionally — a JSON array — and is zipped back into an
    * object against the announced column list, so the public API still yields
-   * row objects. A row with no announcement, or one whose length disagrees with
-   * the list, cannot be read: there is no way to say which value is which, so
-   * it is dropped rather than delivered under guessed names.
+   * row objects. A row with no announcement, one that is not an array, or one
+   * whose length disagrees with the list cannot be read: there is no way to say
+   * which value is which, so it is never delivered under guessed names. Those
+   * are protocol errors: the reason is returned, and the caller reopens the
+   * connection from the last delivered event, so the server announces the
+   * columns again. Anything else wrong with a frame is warned about and dropped.
    *
    * Guarded like `_emitError` and `_emitStatus`: `parser.feed()` dispatches
    * every complete frame in a chunk synchronously, so a subscriber that closes
@@ -664,8 +688,8 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * delivery on `close()`, and gap-fill replay routinely lands many frames in
    * one chunk.
    */
-  private _dispatch(data: string): void {
-    if (this._closed) return;
+  private _dispatch(data: string): string | undefined {
+    if (this._closed) return undefined;
 
     // Two failures with one culprit each, so they are caught separately: a
     // shared catch blamed the server's frame for an exception thrown by the
@@ -678,25 +702,10 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
         row: unknown;
       };
       const columns = this._columns;
-      if (!columns) {
-        this._warnBounded(
-          "no-schema",
-          "[wavehouse] SSE received a row before any schema event:",
-          data,
-        );
-        return;
-      }
-      if (!Array.isArray(msg.row)) {
-        this._warnBounded("row-not-array", "[wavehouse] SSE row is not an array:", data);
-        return;
-      }
+      if (!columns) return "A data frame arrived before any schema frame";
+      if (!Array.isArray(msg.row)) return "A data frame's row is not an array";
       if (msg.row.length !== columns.length) {
-        this._warnBounded(
-          msg.row.length < columns.length ? "row-short" : "row-long",
-          `[wavehouse] SSE row has ${msg.row.length} value(s) but ${columns.length} column(s) were announced:`,
-          data,
-        );
-        return;
+        return `A data frame's row has ${msg.row.length} value(s) but ${columns.length} column(s) were announced`;
       }
       // Null-prototype: a ClickHouse column may legitimately be named
       // `__proto__`, and on a normal object literal that name hits the
@@ -711,7 +720,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       event = { table: msg.table_name, timestamp: msg.received_timestamp, data: row as T };
     } catch {
       this._warnBounded("bad-json", "[wavehouse] SSE received malformed message:", data);
-      return; // ignore malformed messages
+      return undefined; // ignore malformed messages
     }
 
     try {
@@ -719,6 +728,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     } catch (e) {
       console.error("[wavehouse] SSE event handler threw:", e);
     }
+    return undefined;
   }
 
   /** Suppress callbacks that race a `disconnect()`. */
