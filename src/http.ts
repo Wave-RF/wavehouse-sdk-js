@@ -251,6 +251,42 @@ function mayResendResponse(kind: CallKind, error: WaveHouseError, res: Response)
 }
 
 /**
+ * Whether the request holds anything a redirect target must not be handed: a
+ * bearer token, any configured or per-call header, or, in a browser only, an
+ * explicit `credentials: "include"`. Same test as the stream's.
+ */
+function carriesCredential(
+  sdkHeaders: Record<string, string>,
+  clientHeaders: Record<string, string> | undefined,
+  callHeaders: Record<string, string> | undefined,
+  init: RequestInit,
+): boolean {
+  return (
+    sdkHeaders.Authorization !== undefined ||
+    Object.keys(clientHeaders ?? {}).length > 0 ||
+    Object.keys(callHeaders ?? {}).length > 0 ||
+    ("window" in globalThis && init.credentials === "include")
+  );
+}
+
+/** The error for a redirect the SDK did not follow. Never retried. */
+function redirectError(res: Response): WaveHouseError {
+  const location = res.headers.get("Location");
+  const where =
+    res.type === "opaqueredirect"
+      ? "a redirect whose target the browser hides"
+      : `${res.status}${location ? ` to ${location}` : " with no Location"}`;
+  return {
+    status: res.status,
+    code: "REDIRECT",
+    message:
+      `The server answered with ${where}, and the SDK did not follow it: a redirect would forward ` +
+      "this request's credentials and body to the new address. Set `baseURL` to the final URL.",
+    retryable: false,
+  };
+}
+
+/**
  * Internal fetch wrapper with auth injection, retry, backoff, and Retry-After.
  * @internal
  */
@@ -314,11 +350,25 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         body: requestBody,
         signal: guard.signal,
       };
+      // A redirect forwards custom headers (and a body) to wherever it points,
+      // and a re-sent write could run twice. With any credential on the
+      // request, report the redirect instead of following it. Without one,
+      // `fetch` is left to follow.
+      if (carriesCredential(sdkHeaders, clientHeaders, opts.headers, init)) {
+        init.redirect = "manual";
+      }
       // Call the global directly when no override is configured, rather than
       // capturing it — a detached `fetch` reference is not universally safe to
       // invoke, and late binding is what lets tests swap `globalThis.fetch`.
       const doFetch = opts.fetch ?? ctx.options.fetch;
       const res = await guard.race(doFetch ? doFetch(url, init) : fetch(url, init));
+
+      // `manual` surfaces the raw 3xx in Node and an `opaqueredirect` with
+      // status 0 in a browser, which hides the Location; both are the same error.
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        void res.body?.cancel().catch(() => {});
+        return { data: null, error: redirectError(res), headers: res.headers };
+      }
 
       if (res.ok) {
         const text = await guard.race(res.text());

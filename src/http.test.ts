@@ -342,3 +342,62 @@ describe("request", () => {
     }
   });
 });
+
+describe("request redirects", () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  const redirect = () =>
+    new Response(null, { status: 307, headers: { Location: "https://other.example/v1/ops/query" } });
+
+  it("does not follow a redirect when the call carries a token and headers", async () => {
+    fetchSpy.mockImplementation(async () => redirect());
+    const res = await request(
+      makeCtx({
+        options: { maxRetries: 2, headers: { "X-Proxy-Secret": "s3cret" } },
+        auth: () => "tok",
+      }),
+      { method: "POST", path: "/v1/ops/query", rawBody: "DELETE FROM t", kind: "sql" },
+    );
+    expect(fetchSpy.mock.calls[0][1].redirect).toBe("manual");
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(res.data).toBeNull();
+    expect(res.error).toMatchObject({ code: "REDIRECT", status: 307, retryable: false });
+    expect(res.error?.message).toContain("307");
+    expect(res.error?.message).toContain("https://other.example/v1/ops/query");
+  });
+
+  it("does not follow one for a call carrying only per-call headers", async () => {
+    fetchSpy.mockImplementation(async () => redirect());
+    const res = await request(makeCtx(), {
+      method: "GET",
+      path: "/x",
+      headers: { "X-Tenant-ID": "acme" },
+    });
+    expect(fetchSpy.mock.calls[0][1].redirect).toBe("manual");
+    expect(res.error?.code).toBe("REDIRECT");
+  });
+
+  it("reports a browser's opaque redirect, which has status 0 and no Location", async () => {
+    fetchSpy.mockImplementation(async () => {
+      const r = new Response(null, { status: 200 });
+      Object.defineProperty(r, "type", { value: "opaqueredirect" });
+      Object.defineProperty(r, "status", { value: 0 });
+      Object.defineProperty(r, "ok", { value: false });
+      return r;
+    });
+    const res = await request(makeCtx({ auth: () => "tok" }), { method: "GET", path: "/x" });
+    expect(res.error).toMatchObject({ code: "REDIRECT", status: 0, retryable: false });
+  });
+
+  it("leaves redirects to fetch when the request carries no credential", async () => {
+    fetchSpy.mockImplementation(async () => new Response("{}", { status: 200 }));
+    await request(makeCtx(), { method: "GET", path: "/x" });
+    expect(fetchSpy.mock.calls[0][1].redirect).toBeUndefined();
+  });
+});
