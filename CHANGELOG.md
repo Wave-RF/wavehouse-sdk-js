@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed `wh.pipe(name).stream()` and `wh.dlq.stream()`. The server has no stream for a pipe or for dead letters, so both opened a healthy-looking connection that never delivered an event (`GET /v1/stream` serves ingest tables only). Fixes #54.
+
 ### Fixed
 
 - `wh.sql()` and pipe calls are no longer sent twice. A raw SQL statement is resent only when the connection was never made; a pipe call also when the server answers `retryable: true`, with a 429, or with a 503 and `Retry-After`. A bare 5xx or a dropped connection, which may follow a write that ran, is returned as the error. Fixes #56.

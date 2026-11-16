@@ -51,7 +51,7 @@ export class WaveHouseClient<DB extends Database = Database> {
     };
 
     this.schema = new SchemaNamespace(this._ctx);
-    this.dlq = new DLQNamespace(this._ctx, (table, opts) => this._createStream(table, opts));
+    this.dlq = new DLQNamespace(this._ctx);
     this.sys = new SysNamespace(this._ctx);
     this.pipes = new PipesNamespace(this._ctx);
     this.settings = new SettingsNamespace(this._ctx);
@@ -69,7 +69,7 @@ export class WaveHouseClient<DB extends Database = Database> {
     name: string,
     params?: Record<string, unknown>,
   ): PipeRef<Row> {
-    return new PipeRef<Row>(this._ctx, name, params, (t, opts) => this._createStream<Row>(t, opts));
+    return new PipeRef<Row>(this._ctx, name, params);
   }
 
   /**

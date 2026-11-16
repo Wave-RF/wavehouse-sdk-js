@@ -3,7 +3,6 @@ import { PipeRef, PipesNamespace } from "./pipes.js";
 import type { HttpContext } from "./types.js";
 
 let fetchSpy: ReturnType<typeof vi.fn>;
-const mockCreateStream = vi.fn();
 
 function makeCtx(): HttpContext {
   return { baseURL: "http://localhost:8080", options: { maxRetries: 0 } };
@@ -22,7 +21,7 @@ describe("PipeRef", () => {
   });
 
   it("fetch() POSTs to /v1/pipes/{name}", async () => {
-    const ref = new PipeRef(makeCtx(), "top_pages", { limit: 10 }, mockCreateStream);
+    const ref = new PipeRef(makeCtx(), "top_pages", { limit: 10 });
     const result = await ref.fetch();
 
     expect(result.data).toEqual([{ count: 42 }]);
@@ -33,14 +32,14 @@ describe("PipeRef", () => {
   });
 
   it("fetch() sends empty object when no params", async () => {
-    const ref = new PipeRef(makeCtx(), "simple", undefined, mockCreateStream);
+    const ref = new PipeRef(makeCtx(), "simple", undefined);
     await ref.fetch();
 
     expect(JSON.parse(fetchSpy.mock.calls[0][1].body)).toEqual({});
   });
 
   it("is PromiseLike — await auto-executes fetch", async () => {
-    const ref = new PipeRef(makeCtx(), "top_pages", undefined, mockCreateStream);
+    const ref = new PipeRef(makeCtx(), "top_pages", undefined);
     const result = await ref;
 
     expect(result.data).toEqual([{ count: 42 }]);
@@ -51,21 +50,16 @@ describe("PipeRef", () => {
       new Response(JSON.stringify({ error: "pipe not found" }), { status: 404 }),
     );
 
-    const ref = new PipeRef(makeCtx(), "missing", undefined, mockCreateStream);
+    const ref = new PipeRef(makeCtx(), "missing", undefined);
     const result = await ref.fetch();
 
     expect(result.error?.status).toBe(404);
   });
 
-  it("stream() delegates to createStream", () => {
-    const ctrl = {} as any;
-    mockCreateStream.mockReturnValue(ctrl);
-
-    const ref = new PipeRef(makeCtx(), "live", undefined, mockCreateStream);
-    const result = ref.stream();
-
-    expect(mockCreateStream).toHaveBeenCalledWith("live", undefined);
-    expect(result).toBe(ctrl);
+  it("has no stream() — the server has no pipe streams", () => {
+    expect(
+      (new PipeRef(makeCtx(), "live", undefined) as unknown as { stream?: unknown }).stream,
+    ).toBeUndefined();
   });
 });
 

@@ -1,34 +1,17 @@
 import { err, ok } from "./errors.js";
 import { request, tenantParam } from "./http.js";
-import type { StreamController } from "./stream/controller.js";
-import type {
-  HttpContext,
-  OpsRequestOptions,
-  Pipe,
-  PipeRequestOptions,
-  Result,
-  StreamOptions,
-} from "./types.js";
-
-type CreateStreamFn<Row> = (table: string, opts?: StreamOptions) => StreamController<Row>;
+import type { HttpContext, OpsRequestOptions, Pipe, PipeRequestOptions, Result } from "./types.js";
 
 /** Reference to a named query pipe — PromiseLike for convenient `await`. */
 export class PipeRef<Row = Record<string, unknown>> implements PromiseLike<Result<Row[]>> {
   private readonly _ctx: HttpContext;
   private readonly _name: string;
   private readonly _params?: Record<string, unknown>;
-  private readonly _createStream: CreateStreamFn<Row>;
 
-  constructor(
-    ctx: HttpContext,
-    name: string,
-    params: Record<string, unknown> | undefined,
-    createStream: CreateStreamFn<Row>,
-  ) {
+  constructor(ctx: HttpContext, name: string, params: Record<string, unknown> | undefined) {
     this._ctx = ctx;
     this._name = name;
     this._params = params;
-    this._createStream = createStream;
   }
 
   /**
@@ -49,11 +32,6 @@ export class PipeRef<Row = Record<string, unknown>> implements PromiseLike<Resul
     });
     if (error) return err(error);
     return ok(data!);
-  }
-
-  /** Subscribe to live events from the pipe's underlying query. */
-  stream(opts?: StreamOptions): StreamController<Row> {
-    return this._createStream(this._name, opts);
   }
 
   then<TResult1 = Result<Row[]>, TResult2 = never>(
