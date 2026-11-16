@@ -381,6 +381,10 @@ describe("chTypeToTS", () => {
     ["Nullable(String)", "string | null"],
     ["LowCardinality(String)", "string"],
     ["UInt64", "number"],
+    ["Decimal(18, 4)", "string"],
+    ["Decimal64(4)", "string"],
+    ["Nullable(Decimal(10, 2))", "string | null"],
+    ["Array(Decimal(10, 2))", "string[]"],
     ["Bool", "boolean"],
     ["DateTime64(3, 'UTC')", "string"],
     ["Array(UInt8)", "number[]"],
@@ -389,5 +393,19 @@ describe("chTypeToTS", () => {
     ["AggregateFunction(sum, UInt64)", "unknown"],
   ])("%s → %s", (ch, ts) => {
     expect(chTypeToTS(ch)).toBe(ts);
+  });
+});
+
+describe("generateTypes Decimal columns", () => {
+  it("types a Decimal as string and says why", () => {
+    const out = generateTypes([
+      {
+        name: "ledger",
+        columns: [
+          { name: "amount", type: "Decimal(18, 4)", is_nullable: false, has_default: false },
+        ],
+      },
+    ]);
+    expect(out).toMatch(/quoted string[^\n]*\n\s+amount: string;/);
   });
 });

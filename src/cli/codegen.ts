@@ -145,6 +145,10 @@ function chTypeToTS(chType: string): string {
     return "string";
   }
 
+  // Decimal arrives as a quoted JSON string (the server keeps its precision,
+  // which a float64 number would lose), so `number` would lie about the value.
+  if (isDecimal(chType)) return "string";
+
   // Boolean
   if (chType === "Bool") return "boolean";
 
@@ -177,6 +181,13 @@ function chTypeToTS(chType: string): string {
   return "unknown";
 }
 
+/** Whether a column type, under any Nullable/LowCardinality wrapper, is a Decimal. */
+function isDecimal(t: string): boolean {
+  const inner = t.match(/^(?:Nullable|LowCardinality)\((.*)\)$/);
+  if (inner) return isDecimal(inner[1]);
+  return t === "Decimal" || t.startsWith("Decimal(") || /^Decimal(32|64|128|256)\(/.test(t);
+}
+
 function isNumeric(t: string): boolean {
   const numericPrefixes = [
     "UInt8",
@@ -193,7 +204,6 @@ function isNumeric(t: string): boolean {
     "Int256",
     "Float32",
     "Float64",
-    "Decimal",
   ];
   return numericPrefixes.some((p) => t === p || t.startsWith(`${p}(`));
 }
@@ -349,6 +359,11 @@ function generateTypes(schemas: TableSchema[]): string {
     for (const col of table.columns) {
       const tsType = chTypeToTS(col.type);
       const optional = col.has_default ? "?" : "";
+      if (isDecimal(col.type)) {
+        lines.push(
+          "  /** A Decimal, which the server sends as a quoted string to keep its precision. */",
+        );
+      }
       lines.push(`  ${propertyKey(col.name)}${optional}: ${tsType};`);
     }
 
