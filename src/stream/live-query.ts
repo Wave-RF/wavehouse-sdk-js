@@ -22,6 +22,30 @@ export function parseInstant(value: unknown): bigint | undefined {
   return BigInt(ms) * 1_000_000n + BigInt(nanos);
 }
 
+/** The number of fraction digits a timestamp string writes, or 0. @internal */
+function fractionDigits(value: unknown): number {
+  return typeof value === "string" ? (/\.(\d+)/.exec(value)?.[1].length ?? 0) : 0;
+}
+
+/**
+ * Whether an event at `at` is covered by a boundary row at `boundary`. Exact
+ * (nanosecond) order, except that an event written finer than a sub-second
+ * boundary is cut to the boundary's precision: the envelope carries up to
+ * nanoseconds and a `DateTime64(3)` row milliseconds, so an event in the row's
+ * own millisecond is the row, not a newer event. A whole-second boundary is not
+ * cut, since it names no sub-second scale to cut to.
+ * @internal
+ */
+function covered(at: bigint, atDigits: number, boundary: bigint, boundaryDigits: number): boolean {
+  if (boundaryDigits > 0 && atDigits > boundaryDigits) {
+    const unit = 10n ** BigInt(9 - boundaryDigits);
+    // Floor division, so an instant before the epoch rounds the same way.
+    const floor = (n: bigint) => (n - (((n % unit) + unit) % unit)) / unit;
+    return floor(at) <= floor(boundary);
+  }
+  return at <= boundary;
+}
+
 /**
  * Stream-first live query orchestrator.
  *
@@ -111,10 +135,15 @@ export class LiveQuery<T = Record<string, unknown>> {
     // events that arrived during the fetch may repeat a row already in `initial`;
     // the SDK has nothing to tell them apart with.
     let boundary: bigint | undefined;
+    let boundaryDigits = 0;
     if (result && !result.error) {
       for (const row of result.data) {
-        const t = parseInstant((row as Record<string, unknown> | null)?.received_timestamp);
-        if (t !== undefined && (boundary === undefined || t > boundary)) boundary = t;
+        const raw = (row as Record<string, unknown> | null)?.received_timestamp;
+        const t = parseInstant(raw);
+        if (t !== undefined && (boundary === undefined || t > boundary)) {
+          boundary = t;
+          boundaryDigits = fractionDigits(raw);
+        }
       }
     }
 
@@ -133,8 +162,13 @@ export class LiveQuery<T = Record<string, unknown>> {
       // event whose timestamp won't parse can't be proven covered, so it is
       // delivered rather than dropped.
       const column = (event.data as Record<string, unknown> | null | undefined)?.received_timestamp;
-      const at = column != null ? parseInstant(column) : parseInstant(event.timestamp);
-      if (boundary !== undefined && at !== undefined && at <= boundary) {
+      const source = column != null ? column : event.timestamp;
+      const at = parseInstant(source);
+      if (
+        boundary !== undefined &&
+        at !== undefined &&
+        covered(at, fractionDigits(source), boundary, boundaryDigits)
+      ) {
         continue; // already covered by the fetch
       }
       try {

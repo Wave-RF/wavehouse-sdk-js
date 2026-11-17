@@ -372,7 +372,7 @@ export type Schemas = Record<string, TableSchema>;
 // --- Insert result ---
 
 /**
- * A per-record outcome from a batch (array / NDJSON) insert. Mirrors the
+ * A per-record outcome from a batch (array / NDJSON / CSV / TSV) insert. Mirrors the
  * single-object response shape plus the record's position. Exactly one of
  * `ok` / `duplicate` / `error` is set.
  */
@@ -383,7 +383,14 @@ export interface InsertRecordResult {
   ok?: boolean;
   /** Set when dedup skipped the record. */
   duplicate?: boolean;
-  /** Set (with `ok`/`duplicate` absent) when the record was rejected. */
+  /**
+   * Set (with `ok`/`duplicate` absent) when the record was rejected by the
+   * gateway: a failed policy check, a missing dedupe id or a `422` decline. A
+   * record ClickHouse's parser refuses refuses the whole request instead, as a
+   * `400` whose `error.code` is `"clickhouse.rejected"` and whose
+   * `error.details.exception_code` carries ClickHouse's code (117 also covers a
+   * column the caller's role may not write).
+   */
   error?: string;
 }
 
