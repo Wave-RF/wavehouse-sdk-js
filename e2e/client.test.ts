@@ -3,6 +3,8 @@ import { createClient } from "../src/index.js";
 import { collect, eventRow, eventually, newClient, uniqueName } from "./helpers.js";
 
 const wh = newClient();
+// Older servers answer some things differently; see global-setup's probeServer.
+const clickhouseRows = inject("clickhouseRows");
 
 type Row = { event_id: string; name: string; value: number; ts: string };
 
@@ -87,6 +89,58 @@ describe("insert", () => {
     const second = await wh.from("e2e_events").insert(row);
     expect(second.error).toBeNull();
     expect(second.data?.duplicate).toBe(true);
+  });
+});
+
+describe("insert with an unknown column", () => {
+  it("refuses the whole body, or rejects the record on an older server", async () => {
+    const name = uniqueName("unknown-col");
+    const bad = { ...eventRow(name, 2), no_such_column: 1 };
+    const res = await wh.from("e2e_events").insert([eventRow(name, 1), bad]);
+    if (clickhouseRows) {
+      // ClickHouse's parser refuses the body as its INSERT would, and nothing is published.
+      expect(res.data).toBeNull();
+      expect(res.error?.status).toBe(400);
+      expect(res.error?.code).toBe("clickhouse.rejected");
+      expect((res.error?.details as { exception_code?: number })?.exception_code).toBe(117);
+      expect(res.error?.message).toContain("record 2: ");
+      expect(res.error?.retryable).toBe(false);
+      // A later row landing shows the refused body's first row never will.
+      const after = uniqueName("after-refusal");
+      expect((await wh.from("e2e_events").insert(eventRow(after, 1))).error).toBeNull();
+      await rowsNamed(after, 1);
+      const left = await wh.from("e2e_events").selectAll().where("name", "=", name).limit(10);
+      expect(left.data).toHaveLength(0);
+    } else {
+      expect(res.error).toBeNull();
+      expect(res.data).toMatchObject({ ok: false, total: 2, succeeded: 1, failed: 1 });
+      await rowsNamed(name, 1);
+    }
+  });
+});
+
+describe("non-finite floats", () => {
+  // An older server answers a query holding a NaN or an infinity with a 500; from
+  // Wave-RF/WaveHouse#882 on it renders them as "nan", "inf" and "-inf".
+  it.skipIf(!clickhouseRows)("round-trips a NaN and both infinities", async () => {
+    const name = uniqueName("nonfinite");
+    const sent = ["-inf", 1.5, "inf", "nan"];
+    const res = await wh
+      .from("e2e_events")
+      .insert(sent.map((value, i) => ({ event_id: `${name}-${i}`, name, value })));
+    expect(res.error).toBeNull();
+    const rows = await eventually(async () => {
+      const q = await wh
+        .from("e2e_events")
+        .select("event_id", "value")
+        .where("name", "=", name)
+        .orderBy("event_id", "asc")
+        .limit(10);
+      expect(q.error).toBeNull();
+      expect(q.data).toHaveLength(sent.length);
+      return q.data as { event_id: string; value: number | string }[];
+    });
+    expect(rows.map((r) => r.value)).toEqual(sent);
   });
 });
 

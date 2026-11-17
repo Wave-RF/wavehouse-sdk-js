@@ -10,8 +10,9 @@ import {
 } from "testcontainers";
 import type { TestProject } from "vitest/node";
 
-// Pinned to the server's own test harness; 26.8 changed numeric DateTime64 parsing.
-const CLICKHOUSE_IMAGE = "clickhouse/clickhouse-server:26.6.3.62";
+// The server's own test pin. A server that validates ingest with ClickHouse's parser
+// (Wave-RF/WaveHouse#882) needs a line chtypes publishes, which 26.6 is not.
+const CLICKHOUSE_IMAGE = "clickhouse/clickhouse-server:26.8.34.13";
 // The rolling tag of the server's main branch: the SDK follows the server's current protocol.
 const DEFAULT_SERVER_IMAGE = "ghcr.io/wave-rf/wavehouse:dev";
 // Matches auth.jwt_secret in testdata/settings/config.json.
@@ -22,6 +23,11 @@ declare module "vitest" {
   export interface ProvidedContext {
     serverUrl: string;
     adminToken: string;
+    /**
+     * True for a server that validates ingest with ClickHouse's own parser and sends rows as
+     * ClickHouse renders them (Wave-RF/WaveHouse#882), false for an older one.
+     */
+    clickhouseRows: boolean;
   }
 }
 
@@ -150,6 +156,31 @@ async function createFixtures(url: string, token: string): Promise<void> {
   }
 }
 
+/**
+ * Tells the two servers apart by one record naming a column e2e_events lacks: refused whole
+ * with ClickHouse's code 117 by a server that parses ingest with ClickHouse, rejected on its
+ * own in a 200 by an older one. Neither publishes anything. Any other answer fails the run.
+ */
+async function probeServer(url: string, token: string): Promise<boolean> {
+  const res = await fetch(`${url}/v1/ingest?table=e2e_events`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/x-ndjson" },
+    body: '{"event_id":"e2e-probe","no_such_column":1}',
+  });
+  const text = (await res.text()).slice(0, 4096).trim();
+  let body: { code?: string; exception_code?: number; failed?: number } = {};
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // Reported below with the raw answer.
+  }
+  if (res.status === 400 && body.code === "clickhouse.rejected" && body.exception_code === 117) {
+    return true;
+  }
+  if (res.status === 200 && body.failed === 1) return false;
+  throw new Error(`probing a record with an unknown column: ${res.status} ${text}`);
+}
+
 export default async function setup(project: TestProject): Promise<() => Promise<void>> {
   let url = process.env.WAVEHOUSE_URL;
   let token = process.env.WAVEHOUSE_ADMIN_TOKEN;
@@ -163,13 +194,17 @@ export default async function setup(project: TestProject): Promise<() => Promise
     token = mintToken("admin", 24 * 3600);
   }
 
+  let clickhouseRows: boolean;
   try {
     await createFixtures(url, token);
+    clickhouseRows = await probeServer(url, token);
   } catch (e) {
     await stop();
     throw e;
   }
   project.provide("serverUrl", url);
   project.provide("adminToken", token);
+  project.provide("clickhouseRows", clickhouseRows);
+  process.stderr.write(`e2e: server renders rows with ClickHouse: ${clickhouseRows}\n`);
   return stop;
 }
