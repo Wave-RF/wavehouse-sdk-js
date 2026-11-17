@@ -253,6 +253,20 @@ describe("liveQuery dedup boundary", () => {
     expect(seen).toEqual([1]);
   });
 
+  it("treats an event inside the boundary row's own millisecond as covered", async () => {
+    // The envelope carries nanoseconds; a DateTime64(3) row only milliseconds.
+    const seen = await run(
+      [{ received_timestamp: "2026-03-24T12:00:00.123Z" }],
+      [
+        ev("2026-03-24T12:00:00Z", 1),
+        ev("2026-03-24T12:00:00.123456789Z", 2),
+        ev("2026-03-24T12:00:00.124Z", 3),
+        ev("2026-03-24T12:00:01Z", 4),
+      ],
+    );
+    expect(seen).toEqual([3, 4]);
+  });
+
   it("ignores rows whose timestamp does not parse, and delivers events whose own does not", async () => {
     const seen = await run(
       [{ received_timestamp: "garbage" }, { received_timestamp: "2026-01-01 00:00:05" }],

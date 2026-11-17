@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `wavehouse-codegen` types `Float32`, `Float64` and `BFloat16` as `number | "nan" | "inf" | "-inf"`, because the server renders a NaN or infinity as one of those strings on queries, pipes and streams (Wave-RF/WaveHouse#882). An array element that is a union is parenthesized: `(number | null)[]`. Older servers never send the strings, so the wider type is still correct against them.
+- A stream's client-side `where` filters (`=`, `!=`, `in`, `>`, `>=`, `<`, `<=`) compare two strings that both read as timestamps by instant, not by spelling, so `…00.000Z` matches a filter written `…00Z` or with an offset. Other strings keep strict equality and string order.
+- `liveQuery` treats a buffered event that falls within the boundary row's own sub-second precision as covered by the backfill: an event stamped `….123456789Z` against a `DateTime64(3)` row at `….123Z` is no longer delivered twice.
+- Doc comments: a refused ingest body is a whole-request `400` with `error.code` `clickhouse.rejected` and ClickHouse's `exception_code` in `error.details`; `wh.sql()` takes one statement per call.
+
 ## [0.3.0] - 2026-11-17
 
 ### Added

@@ -2,7 +2,7 @@ import { err, okPage } from "./errors.js";
 import { callOpts, request } from "./http.js";
 import type { StreamTransport } from "./stream/controller.js";
 import { StreamController } from "./stream/controller.js";
-import { LiveQuery } from "./stream/live-query.js";
+import { LiveQuery, parseInstant } from "./stream/live-query.js";
 import type {
   Aggregation,
   Duration,
@@ -464,9 +464,9 @@ function matchesFilters(row: Record<string, unknown>, filters: QueryFilter[]): b
 function evaluateFilter(actual: unknown, op: string, expected: unknown): boolean {
   switch (op) {
     case "eq":
-      return actual === expected;
+      return sameValue(actual, expected);
     case "neq":
-      return actual !== expected;
+      return !sameValue(actual, expected);
     case "gt":
       return compareOrdered(actual, expected, (a, b) => a > b);
     case "gte":
@@ -476,7 +476,7 @@ function evaluateFilter(actual: unknown, op: string, expected: unknown): boolean
     case "lte":
       return compareOrdered(actual, expected, (a, b) => a <= b);
     case "in":
-      return Array.isArray(expected) && expected.includes(actual);
+      return Array.isArray(expected) && expected.some((v) => sameValue(actual, v));
     case "like": {
       if (typeof actual !== "string" || typeof expected !== "string") return false;
       // Convert SQL LIKE pattern to regex: % → .*, _ → .
@@ -490,10 +490,26 @@ function evaluateFilter(actual: unknown, op: string, expected: unknown): boolean
 }
 
 /**
+ * @internal Equality for `eq`, `neq` and `in`: strict, except that two strings
+ * that both read as timestamps are equal when they name the same instant — a
+ * `DateTime64(3)` value renders as `…00.000Z`, which a filter written `…00Z`
+ * must still match, as it does on the server.
+ */
+function sameValue(actual: unknown, expected: unknown): boolean {
+  if (actual === expected) return true;
+  if (typeof actual !== "string" || typeof expected !== "string") return false;
+  const a = parseInstant(actual);
+  return a !== undefined && a === parseInstant(expected);
+}
+
+/**
  * @internal Apply an ordered comparison only when both sides are the same
- * comparable primitive (number-vs-number or string-vs-string — strings are
- * lexicographic, which is correct for ISO-8601 timestamps). Mismatched or
- * unsupported types return false instead of relying on JS coercion.
+ * comparable primitive (number-vs-number or string-vs-string). Two strings
+ * that both read as timestamps are ordered by instant: lexicographic order is
+ * right only for the same zone at the same scale, and the server renders
+ * `…00.000Z` where a filter may say `…00Z` or use an offset. Other strings are
+ * lexicographic. Mismatched or unsupported types return false instead of
+ * relying on JS coercion.
  */
 function compareOrdered(
   actual: unknown,
@@ -504,6 +520,9 @@ function compareOrdered(
     return cmp(actual, expected);
   }
   if (typeof actual === "string" && typeof expected === "string") {
+    const a = parseInstant(actual);
+    const b = parseInstant(expected);
+    if (a !== undefined && b !== undefined) return cmp(a < b ? -1 : a > b ? 1 : 0, 0);
     // `>`/`<` on strings is lexicographic; reuse the same comparator by
     // casting through `as unknown as number` — the runtime operator works
     // identically on strings.
