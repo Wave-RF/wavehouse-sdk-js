@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveURL } from "./url.js";
+import { normalizeBaseURL, resolveURL } from "./url.js";
 
 describe("resolveURL", () => {
   it("resolves against a root-hosted base", () => {
@@ -72,7 +72,51 @@ describe("resolveURL", () => {
     );
   });
 
-  it("throws on a base with no scheme", () => {
-    expect(() => resolveURL("example.com/api", "/v1/query")).toThrow();
+  it("gives a base with no scheme one", () => {
+    expect(resolveURL("example.com/api", "/v1/query").toString()).toBe(
+      "https://example.com/api/v1/query",
+    );
   });
+});
+
+// The same table is in wavehouse-sdk-go's client_test.go: both SDKs must
+// resolve one input to one base.
+describe("normalizeBaseURL", () => {
+  it.each([
+    ["example.com", "https://example.com"],
+    ["example.com:8080/api/warehouse", "https://example.com:8080/api/warehouse"],
+    ["HTTPS://X.COM", "https://X.COM"],
+    ["localhost", "http://localhost"],
+    ["localhost:8080", "http://localhost:8080"],
+    ["127.0.0.1:9000/x", "http://127.0.0.1:9000/x"],
+    ["127.5.6.7", "http://127.5.6.7"],
+    ["[::1]:8080", "http://[::1]:8080"],
+    ["::1", "http://[::1]"],
+    ["foo.localhost:3000", "http://foo.localhost:3000"],
+    ["//example.com/api", "https://example.com/api"],
+    ["//localhost:8080", "http://localhost:8080"],
+    ["user@host:8080", "https://user@host:8080"],
+    ["  example.com  ", "https://example.com"],
+    ["http://lan-host:8080", "http://lan-host:8080"],
+    ["http://example.com", "http://example.com"],
+    ["https://example.com/api/", "https://example.com/api/"],
+  ])("%s -> %s", (input, want) => {
+    expect(normalizeBaseURL(input).replace(/\/+$/, "")).toBe(want.replace(/\/+$/, ""));
+  });
+
+  it("resolves a scheme-less base like the same base with its scheme", () => {
+    expect(resolveURL("localhost:8080/api", "/v1/query").toString()).toBe(
+      "http://localhost:8080/api/v1/query",
+    );
+    expect(resolveURL("example.com/api", "/v1/query").toString()).toBe(
+      "https://example.com/api/v1/query",
+    );
+  });
+
+  it.each(["", "   ", "https://", "/api", "/api/warehouse", "//", "/", "https:///x"])(
+    "rejects %j with a message naming the requirement",
+    (input) => {
+      expect(() => resolveURL(input, "/v1/query")).toThrow(/baseURL .* is not a usable URL/);
+    },
+  );
 });

@@ -1,4 +1,6 @@
 import { DLQNamespace } from "./dlq.js";
+import { err, ok } from "./errors.js";
+import { callOpts, request } from "./http.js";
 import { PipeRef, PipesNamespace } from "./pipes.js";
 import { SchemaNamespace } from "./schema.js";
 import { SettingsNamespace } from "./settings.js";
@@ -8,13 +10,16 @@ import { SSETransport } from "./stream/sse.js";
 import { SysNamespace } from "./sys.js";
 import { TableRef } from "./table.js";
 import type {
+  CallOptions,
   ClientConfig,
   Database,
   HttpContext,
   OpsRequestOptions,
   Result,
   StreamOptions,
+  VersionInfo,
 } from "./types.js";
+import { assertBaseHasHost, assertBaseScheme } from "./url.js";
 
 type TableName<DB> = DB extends Database ? Extract<keyof DB, string> : string;
 type RowType<DB, T extends string> = DB extends Database
@@ -39,11 +44,31 @@ export class WaveHouseClient<DB extends Database = Database> {
   readonly settings: SettingsNamespace;
 
   constructor(config: ClientConfig<DB>) {
+    // Request paths are joined onto the base, so a query or fragment on it
+    // could only ever be dropped; say so rather than lose it silently.
+    if (/[?#]/.test(config.baseURL)) {
+      throw new TypeError(
+        `baseURL ${JSON.stringify(config.baseURL)} must not carry a query string or fragment: give the origin and an optional path prefix, such as "https://example.com/api"`,
+      );
+    }
+    // Refused here, not on the first call: a base that names no host (a bare
+    // path such as "/api") would otherwise read as one.
+    assertBaseHasHost(config.baseURL);
+    assertBaseScheme(config.baseURL);
+    // A negative or fractional count would make the retry loop run zero times.
+    const maxRetries = config.options?.maxRetries;
+    if (maxRetries !== undefined && (!Number.isInteger(maxRetries) || maxRetries < 0)) {
+      throw new TypeError(
+        `options.maxRetries must be a non-negative integer, got ${String(maxRetries)}`,
+      );
+    }
     this._ctx = {
       baseURL: config.baseURL.replace(/\/+$/, ""),
       auth: config.auth,
       options: {
-        maxRetries: config.options?.maxRetries ?? 2,
+        maxRetries: maxRetries ?? 2,
+        maxRetryAfterMs: config.options?.maxRetryAfterMs,
+        attemptTimeoutMs: config.options?.attemptTimeoutMs,
         fetch: config.options?.fetch,
         headers: config.options?.headers,
         fetchOptions: config.options?.fetchOptions,
@@ -51,10 +76,23 @@ export class WaveHouseClient<DB extends Database = Database> {
     };
 
     this.schema = new SchemaNamespace(this._ctx);
-    this.dlq = new DLQNamespace(this._ctx, (table, opts) => this._createStream(table, opts));
+    this.dlq = new DLQNamespace(this._ctx);
     this.sys = new SysNamespace(this._ctx);
     this.pipes = new PipesNamespace(this._ctx);
     this.settings = new SettingsNamespace(this._ctx);
+  }
+
+  /**
+   * The server's build metadata, from `GET /version`.
+   */
+  async version(opts?: CallOptions): Promise<Result<VersionInfo>> {
+    const { data, error } = await request<VersionInfo>(this._ctx, {
+      method: "GET",
+      path: "/version",
+      ...callOpts(opts),
+    });
+    if (error) return err(error);
+    return ok(data!);
   }
 
   /** Get a table reference for building queries, inserts, and streams. */
@@ -69,7 +107,7 @@ export class WaveHouseClient<DB extends Database = Database> {
     name: string,
     params?: Record<string, unknown>,
   ): PipeRef<Row> {
-    return new PipeRef<Row>(this._ctx, name, params, (t, opts) => this._createStream<Row>(t, opts));
+    return new PipeRef<Row>(this._ctx, name, params);
   }
 
   /**
@@ -78,9 +116,7 @@ export class WaveHouseClient<DB extends Database = Database> {
    * `service` role). The endpoint proxies straight to ClickHouse's HTTP
    * interface so any ClickHouse-accepted SQL works; positional `?` param
    * binding is NOT supported — inline literals or use the structured query
-   * builder for safe binding. See sql.ts for details. `opts.tenant` names the
-   * tenant whose ClickHouse the SQL runs against, the default tenant without
-   * it.
+   * builder for safe binding. See sql.ts for details.
    */
   sql<Row = Record<string, unknown>>(
     query: string,
@@ -111,6 +147,8 @@ export class WaveHouseClient<DB extends Database = Database> {
       auth: this._ctx.auth,
       fetch: this._ctx.options.fetch,
       headers: this._ctx.options.headers,
+      callHeaders: opts?.headers,
+      attemptTimeoutMs: opts?.attemptTimeoutMs ?? this._ctx.options.attemptTimeoutMs,
       fetchOptions: this._ctx.options.fetchOptions,
     });
     const controller = new StreamController<T>(transport);

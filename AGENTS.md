@@ -22,11 +22,13 @@ The package has one runtime dependency, `eventsource-parser`, and keeps it that 
 
 ## Tests
 
-Two layers exist today: unit tests (`pnpm test`, HTTP mocked, gated at a 40% statement floor) and the built-package smoke check (`make smoke`), which loads the ESM, CJS and IIFE builds and the bin at the oldest Node `engines.node` admits and type-checks a CommonJS and an ESM consumer. Request conformance tests and live tests against a real server do not exist yet; don't describe a mocked test as covering them.
+Three layers exist today: unit tests (`pnpm test`, HTTP mocked, gated at an 87% statement floor), the built-package smoke check (`make smoke`), which loads the ESM, CJS and IIFE builds and the bin at the oldest Node `engines.node` admits and type-checks a CommonJS and an ESM consumer, and live tests (`make test-e2e`). Request conformance is `src/conformance.test.ts`, which replays the shared `testdata/wire_cases.json` against a mocked `fetch` and checks the exact request each call sends. Server end-to-end tests do not exist yet; don't describe a mocked test as covering them.
+
+The live tests are in `e2e/`, with their own `vitest.e2e.config.ts`, and need Docker. A `globalSetup` starts ClickHouse and the server's rolling `:dev` image (always pulled) with `testcontainers`, using the settings in `e2e/testdata/settings/`, and creates the `e2e_events` fixture table straight through the server's admin endpoints so a broken SDK fails its own tests rather than setup. `WAVEHOUSE_IMAGE` overrides the server image; `WAVEHOUSE_URL` with `WAVEHOUSE_ADMIN_TOKEN` (an admin-role JWT) skips the containers and uses a running server. CI runs them as the `Live tests` job. They are not part of `make ci`. Live queries (`liveQuery`) are not covered yet.
 
 ## Releases
 
-A release is a tag `vX.Y.Z` on `main`; the tag is the version, and `.github/workflows/publish-npm.yml` stamps it into `package.json` at publish time, so don't bump `version` in a PR. Pushes to `main` also publish a `dev` snapshot. Publishing is gated on the repository variable `NPM_PUBLISH_ENABLED` and stays off until npm's trusted publisher is moved here from the server repository; the cutover steps are in the workflow's header.
+A release is a tag `vX.Y.Z` on `main`; the tag is the version, and `.github/workflows/publish-npm.yml` stamps it into `package.json` at publish time, so don't bump `version` in a PR. Pushes to `main` also publish a `dev` snapshot. npm's trusted publisher for the package is this repository's workflow, and publishing is gated on the repository variable `NPM_PUBLISH_ENABLED`.
 
 ## Documentation
 
@@ -73,7 +75,7 @@ A test that hand-writes a server response can't catch a decoding bug against the
 
 ### Files kept in step
 
-These files are identical in both SDK repositories: `.claude/settings.json`, `.editorconfig`, `.github/copilot-instructions.md`, `.github/release.yml`, `.github/workflows/shared-checks.yml`, `CLAUDE.md`, `LICENSE`, `scripts/lint-pr-title.sh`, `scripts/ci/check-pr-title.sh`, `scripts/ci/release-channel.sh` and `scripts/ci/require-needs.sh`. Nothing syncs them, so a change to one goes into both repositories. Branch and tag protection come from organization rulesets that match every `wavehouse-sdk-*` repository.
+These files are identical in both SDK repositories: `.claude/settings.json`, `.editorconfig`, `.github/copilot-instructions.md`, `.github/release.yml`, `.github/workflows/shared-checks.yml`, `CLAUDE.md`, `LICENSE`, `scripts/lint-pr-title.sh`, `scripts/ci/check-pr-title.sh`, `scripts/ci/release-channel.sh`, `scripts/ci/require-needs.sh` and `testdata/wire_cases.json`. In that file an optional `"sdks"` list (`["go"]` or `["js"]`) limits a case to the SDKs that have the feature, and each SDK replays only its own. Nothing syncs them, so a change to one goes into both repositories. Branch and tag protection come from organization rulesets that match every `wavehouse-sdk-*` repository.
 
 ### This repository is public
 

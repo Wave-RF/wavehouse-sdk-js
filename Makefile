@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := ci
 
-.PHONY: ci fix install lint typecheck test build smoke
+.PHONY: ci fix install lint typecheck test test-e2e build smoke
 
 ci: install lint typecheck test build smoke ## Everything CI runs
 
@@ -17,6 +17,9 @@ typecheck:
 
 test: ## unit tests with the coverage floor
 	pnpm run test:coverage
+
+test-e2e: ## live tests against a real server (needs Docker; not part of ci)
+	pnpm run test:e2e
 
 build:
 	pnpm run build

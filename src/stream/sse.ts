@@ -1,7 +1,13 @@
 import { createParser } from "eventsource-parser";
 import { parseErrorResponse } from "../errors.js";
-import { mergeHeaders } from "../http.js";
-import type { FetchLike, StreamEvent, StreamStatus, WaveHouseError } from "../types.js";
+import { attemptTimeout, mergeHeaders, overlayHeaders, resolveClientHeaders } from "../http.js";
+import type {
+  FetchLike,
+  HeadersProvider,
+  StreamEvent,
+  StreamStatus,
+  WaveHouseError,
+} from "../types.js";
 import { resolveURL } from "../url.js";
 import type { StreamTransport } from "./controller.js";
 
@@ -11,7 +17,12 @@ export interface SSEOptions {
   since?: string;
   auth?: () => Promise<string> | string;
   fetch?: FetchLike;
-  headers?: Record<string, string>;
+  /** The client's `options.headers`; a function is called before every connect. */
+  headers?: Record<string, string> | HeadersProvider;
+  /** Headers for this subscription, over `headers` and under the SDK's own. */
+  callHeaders?: Record<string, string>;
+  /** Per-connect deadline up to the response headers; never an established stream. */
+  attemptTimeoutMs?: number;
   fetchOptions?: RequestInit;
 }
 
@@ -73,12 +84,39 @@ function releaseBody(res: Response): void {
   if (res.body && !res.body.locked) res.body.cancel().catch(() => {});
 }
 
+/**
+ * Milliseconds a `Retry-After` header asks for, clamped to `MAX_BACKOFF_MS` so a
+ * hostile or fat-fingered value can't strand a stream. Both header forms are
+ * read (delta-seconds and an HTTP-date); anything else, or a date already
+ * past, is no request at all.
+ */
+function parseRetryAfter(value: string | null): number | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  const ms = /^\d+$/.test(v) ? Number(v) * 1000 : Date.parse(v) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return Math.min(ms, MAX_BACKOFF_MS);
+}
+
+/** Rejects with the signal's reason once `ac` aborts. */
+function rejectOnAbort(ac: AbortController): Promise<never> {
+  const p = new Promise<never>((_, reject) => {
+    if (ac.signal.aborted) reject(ac.signal.reason);
+    else ac.signal.addEventListener("abort", () => reject(ac.signal.reason), { once: true });
+  });
+  // Only meaningful while raced; settled later it must not be unhandled.
+  p.catch(() => {});
+  return p;
+}
+
 /** Outcome of one connection attempt, driving the reconnect decision. */
 interface AttemptResult {
   /** Milliseconds the connection stayed readable; 0 if it never opened. */
   liveMs: number;
   /** Stop for good: a bad token or missing table can't be fixed by retrying. */
   terminal: boolean;
+  /** Floor for the wait before the next attempt, from the response's `Retry-After`. */
+  retryAfterMs?: number;
 }
 
 /**
@@ -87,7 +125,7 @@ interface AttemptResult {
  * Replaces `EventSource`, which cannot set request headers — the reason the JWT
  * used to ride in `?token=`, where it crossed every intermediary in the request
  * URI. In exchange for the `Authorization` header this owns what `EventSource`
- * used to provide: framing, reconnect, and `Last-Event-ID` resumption.
+ * used to provide: framing, reconnect, and resumption from the last event id.
  */
 export class SSETransport<T = Record<string, unknown>> implements StreamTransport<T> {
   private _opts: SSEOptions;
@@ -106,7 +144,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   private _started = false;
   private _counted = false;
   /**
-   * Most recent non-empty event id, replayed as `Last-Event-ID` on reconnect.
+   * Most recent non-empty event id, sent as `Last-Event-ID` on reconnect.
    *
    * Deliberately ignores empty ids. The server emits a blank `id:` line for
    * passthrough payloads, and per the SSE spec an empty `id` field *clears* the
@@ -114,6 +152,12 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * resumption point mid-stream and re-open from the beginning.
    */
   private _lastEventId: string | null = null;
+  /**
+   * Where a reconnect resumes when there is neither `opts.since` nor an event
+   * id yet: the start of the first live connection, so rows ingested during
+   * the backoff are replayed rather than skipped at the live head.
+   */
+  private _resumeSince: string | null = null;
   /** Reconnect floor most recently requested by the server via `retry:`. */
   private _retryFloorMs = 0;
   /** Cuts a reconnect gap short when set — see `_sleep`. */
@@ -122,7 +166,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * Column names for the rows currently arriving, from the most recent
    * `event: schema` frame. Rows travel positionally, so this is what turns one
    * back into an object; `null` means none has been announced yet, and a data
-   * frame arriving in that state is unreadable rather than merely unlabeled.
+   * frame arriving in that state is a protocol error (see `_dispatch`).
    *
    * Reset at the start of every connection attempt: a reconnect re-announces,
    * and zipping a new connection's rows under the previous one's list would
@@ -130,18 +174,16 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    */
   private _columns: string[] | null = null;
   /**
-   * Per-cause warning budget for the current connection. A server that predates
-   * the positional wire sends every row without a schema event, so an unbounded
-   * `console.warn` per row floods the console for the whole connection — and so
-   * does any other per-frame warn against a server sending something the reader
-   * cannot use. Every PER-FRAME warn site is bounded, but keyed by CAUSE so a row
-   * with no announcement, a short row, a long row, a non-array row, a malformed
-   * schema frame and unparseable JSON stay individually visible: collapsing them
-   * behind one flag would hide the distinct failures the warning exists to
-   * surface. Reset per attempt. (The per-connect() notices are not per-frame and
-   * are not bounded here.)
+   * The frame that last broke a connection, kept so the connection that follows
+   * can tell a transient failure from a persistent one: the same frame failing
+   * again after a resume from `resumeId` is skipped (see `_pump`). Cleared once
+   * a frame of its kind is delivered or skipped.
    */
-  private _warnBudget = new Map<string, number>();
+  private _suspect: { kind: "data" | "schema"; id: string; resumeId: string | null } | null = null;
+  /** Frames seen on this connection, per kind; 0 means "the first one after resuming". */
+  private _seq = { data: 0, schema: 0 };
+  /** A schema frame was skipped on this connection, so its rows cannot be read. */
+  private _schemaSkipped = false;
 
   onEvent: ((event: StreamEvent<T>) => void) | null = null;
   onStatus: ((status: StreamStatus) => void) | null = null;
@@ -220,7 +262,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     let attempt = 0;
 
     while (!this._closed) {
-      const { liveMs, terminal } = await this._attempt();
+      const { liveMs, terminal, retryAfterMs } = await this._attempt();
 
       if (this._closed) return;
       if (terminal) {
@@ -236,23 +278,9 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       if (liveMs >= STABLE_CONNECTION_MS) attempt = 0;
 
       this._emitStatus("reconnecting");
-      await this._sleep(backoff(attempt, this._retryFloorMs));
+      // A `Retry-After` is a floor for this wait only; a `retry:` field persists.
+      await this._sleep(backoff(attempt, Math.max(this._retryFloorMs, retryAfterMs ?? 0)));
       attempt++;
-    }
-  }
-
-  /**
-   * Warn at most `LIMIT` times per cause per connection, then once more to say
-   * how many were suppressed. Returns nothing — callers warn and bail as before.
-   */
-  private _warnBounded(cause: string, message: string, data: unknown): void {
-    const LIMIT = 3;
-    const seen = (this._warnBudget.get(cause) ?? 0) + 1;
-    this._warnBudget.set(cause, seen);
-    if (seen <= LIMIT) {
-      console.warn(message, data);
-    } else if (seen === LIMIT + 1) {
-      console.warn(`${message} — further occurrences suppressed for this connection`);
     }
   }
 
@@ -261,7 +289,8 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     const ac = new AbortController();
     this._abort = ac;
     this._columns = null;
-    this._warnBudget.clear();
+    this._seq = { data: 0, schema: 0 };
+    this._schemaSkipped = false;
 
     // A URL that won't build is deterministic — every retry produces the same
     // failure — so it ends the stream rather than looping.
@@ -295,19 +324,61 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       return { liveMs: 0, terminal: false };
     }
 
+    // The per-attempt deadline bounds the connect, up to the response headers:
+    // an established stream is long-lived and has no deadline of its own. It
+    // aborts the same controller `disconnect()` does, which is safe because
+    // `_closed` tells the two apart.
+    const timeoutMs = attemptTimeout(this._opts.attemptTimeoutMs);
+    let timedOut = false;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            ac.abort();
+          }, timeoutMs);
+    const timeoutError = (): WaveHouseError => ({
+      status: 0,
+      code: "SSE_ATTEMPT_TIMEOUT",
+      message: `The stream connection got no response within ${timeoutMs} ms`,
+      retryable: true,
+    });
+
     let res: Response;
     try {
       const doFetch = this._opts.fetch;
-      res = doFetch ? await doFetch(target, init) : await fetch(target, init);
+      const pending = doFetch ? doFetch(target, init) : fetch(target, init);
+      // Raced against the abort so a `fetch` that ignores its signal still
+      // lets the deadline end the attempt.
+      res = await (timer === undefined ? pending : Promise.race([pending, rejectOnAbort(ac)]));
     } catch (e) {
+      clearTimeout(timer);
       if (this._closed) return { liveMs: 0, terminal: true };
-      this._emitError({
-        status: 0,
-        code: "SSE_NETWORK_ERROR",
-        message: e instanceof Error ? e.message : String(e),
-        retryable: true,
-      });
+      this._emitError(
+        timedOut
+          ? timeoutError()
+          : {
+              status: 0,
+              code: "SSE_NETWORK_ERROR",
+              message: e instanceof Error ? e.message : String(e),
+              retryable: true,
+            },
+      );
       return { liveMs: 0, terminal: false };
+    }
+    clearTimeout(timer);
+    if (timedOut && !this._closed) {
+      // The headers arrived as the deadline fired, so the body is aborted too.
+      releaseBody(res);
+      this._emitError(timeoutError());
+      return { liveMs: 0, terminal: false };
+    }
+
+    // A fetch that ignores `init.signal` can resolve after `disconnect()`;
+    // don't open a connection nobody wants.
+    if (this._closed) {
+      releaseBody(res);
+      return { liveMs: 0, terminal: true };
     }
 
     // Redirects are refused, not followed — see `_init`. Surfaced explicitly
@@ -337,22 +408,32 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
 
     if (!res.ok) {
       const error = await parseErrorResponse(res);
+      // 429 is a retry-later status from a fronting rate limiter, so a stream
+      // that took one must re-dial rather than stay dead until a reload — unless
+      // the body says otherwise. Every other 4xx stays terminal.
+      if (
+        res.status === 429 &&
+        (error.details as { retryable?: unknown } | undefined)?.retryable !== false
+      ) {
+        error.retryable = true;
+      }
       this._emitError(error);
       // 4xx is terminal: whatever rejected this usually won't be talked round
       // by repeating the request, and native EventSource likewise stops on
-      // non-200. The exception is a 429/408 from a fronting rate limiter, which
-      // is transient even though the stream still ends (#469). Note WaveHouse
-      // doesn't reject here *for authentication* — the endpoint is ungated and
-      // answers a bad token with a reduced view, which is why `auth` is re-read
-      // per attempt (#239 tracks enforcing expiry). The 4xx it raises itself are
-      // a 400 for a missing or empty `table` (internal/api/stream.go) or a
-      // malformed `X-Tenant-ID`, and a 404 `unknown tenant` for a tenant it does
-      // not serve (internal/api/tenant.go) — never held, or removed, which is
-      // what a stream the server ended with its tenant reconnects into; a
-      // rejected tenant's 503 is retried like any 5xx. Any other 404/405 means
-      // the request missed the route entirely (router.go's chi handlers), and
-      // anything else comes from something in front — a gateway, or a proxy.
-      return { liveMs: 0, terminal: !error.retryable };
+      // non-200. Note WaveHouse doesn't reject here *for authentication* — the
+      // endpoint is ungated and answers a bad token with a reduced view, which
+      // is why `auth` is re-read per attempt (#239 tracks enforcing expiry). The
+      // 4xx it raises itself is
+      // a 400 for a missing or empty `table` (internal/api/stream.go). Any
+      // other 404/405 means the request missed the route entirely (router.go's
+      // chi handlers), and anything else comes from something in front — a
+      // gateway, or a proxy.
+      const retry = error.retryable;
+      return {
+        liveMs: 0,
+        terminal: !retry,
+        retryAfterMs: retry ? parseRetryAfter(res.headers.get("Retry-After")) : undefined,
+      };
     }
 
     // A 200 that isn't an event stream is an intermediary answering for the
@@ -392,27 +473,43 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       return { liveMs: 0, terminal: true };
     }
 
+    if (!this._opts.since && !this._lastEventId && !this._resumeSince) {
+      // The server's clock, since that is what `since` is compared against.
+      // `Date` has whole-second resolution, so it is never later than the real
+      // start; without it, local time less a skew allowance.
+      const date = Date.parse(res.headers.get("Date") ?? "");
+      this._resumeSince = new Date(Number.isNaN(date) ? Date.now() - 5000 : date).toISOString();
+    }
+
     this._emitStatus("live");
     const openedAt = Date.now();
-    await this._pump(body);
-    return { liveMs: Date.now() - openedAt, terminal: false };
+    const overflowed = await this._pump(body); // true: overflow or protocol error
+    // An overflow or a protocol error ends a connection that was readable but
+    // not healthy: counting it as held would reset the backoff each cycle, and a
+    // peer that does it every time (a broken intermediary) would be re-dialed at
+    // a flat rate.
+    return { liveMs: overflowed ? 0 : Date.now() - openedAt, terminal: false };
   }
 
   /** Resolve the stream URL. Throws on a `baseURL` that isn't a usable http(s) origin. */
   private _url(): string {
     const url = resolveURL(this._opts.baseURL, "/v1/stream");
     // Caught here rather than at `fetch`, which reports an unusable scheme as a
-    // generic failure the loop would then retry forever. `baseURL` must be
-    // absolute, so a bare host throws out of `resolveURL` above; this catches
-    // the absolute-but-wrong case, `ws://` being the tempting one for streams.
+    // generic failure the loop would then retry forever. `resolveURL` above
+    // throws for a base it cannot read; this catches the readable-but-wrong
+    // case, `ws://` being the tempting one for streams.
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(
         `baseURL must use http or https, got "${url.protocol}". Streaming is plain HTTP — there is no WebSocket endpoint.`,
       );
     }
     url.searchParams.set("table", this._opts.table);
-    if (this._opts.since) {
-      url.searchParams.set("since", this._opts.since);
+    // Once an event id exists it travels as `Last-Event-ID` (see `_init`) and
+    // `since` is left off, so the header is the one resumption point. Before
+    // that, `since` is all there is to send.
+    const since = this._lastEventId ? null : this._opts.since || this._resumeSince;
+    if (since) {
+      url.searchParams.set("since", since);
     }
     return url.toString();
   }
@@ -431,21 +528,32 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       }
     }
 
-    // Takes precedence over `since` server-side, so the initial window stays on
-    // the URL and resumption rides the header once there's something to resume.
-    if (this._lastEventId) {
-      base["Last-Event-ID"] = this._lastEventId;
-    }
+    // Resolved per attempt like the token: a rotated credential is the one a
+    // reconnect sends. Client headers, then this subscription's, then the SDK's.
+    const custom = overlayHeaders(
+      await resolveClientHeaders(this._opts.headers),
+      this._opts.callHeaders,
+    );
+
+    // The server reads the event id as the resume timestamp. Before any event
+    // has been delivered there is no id, so `_url` sends `since` instead.
+    if (this._lastEventId) base["Last-Event-ID"] = this._lastEventId;
 
     // Anything a redirect target must not be handed: the bearer token, or the
     // configured headers that carry proxy service-token secrets.
+    // An explicit `credentials: "include"` is the documented opt-in to cookie
+    // auth, so it counts too — in a browser only, the one place it is honored.
+    // The implicit `same-origin` default stays invisible: it cannot be told
+    // from a deployment with no cookies at all.
     const credentialed =
-      base.Authorization !== undefined || Object.keys(this._opts.headers ?? {}).length > 0;
+      base.Authorization !== undefined ||
+      Object.keys(custom).length > 0 ||
+      ("window" in globalThis && this._opts.fetchOptions?.credentials === "include");
 
     const init: RequestInit = {
       ...this._opts.fetchOptions,
       method: "GET",
-      headers: mergeHeaders(base, this._opts.headers),
+      headers: mergeHeaders(base, custom),
       signal,
       // Owned by the SDK rather than left to `fetchOptions`, unlike the REST
       // path, because on a stream these are correctness rather than preference:
@@ -463,12 +571,13 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
       //              convenience. Without either, redirects are followed, so CDN
       //              canonicalization, geo/LB indirection, and an http→https
       //              upgrade all just work. The test is deliberately that
-      //              concrete pair and not "is this authenticated": cookies do
-      //              not appear in it. A cookie is re-derived per
-      //              destination rather than carried, so under the default
-      //              same-origin credentials mode it survives a redirect only
-      //              while the hop stays inside both the request's origin and
-      //              the cookie's Path; outside either the stream is
+      //              concrete set and not "is this authenticated": an explicit
+      //              `credentials: "include"` is in it, but cookies relied on
+      //              through the implicit same-origin default are not. A cookie
+      //              is re-derived per destination rather than carried, so under
+      //              the default same-origin credentials mode it survives a
+      //              redirect only while the hop stays inside both the request's
+      //              origin and the cookie's Path; outside either the stream is
       //              silently unauthed. See #478 and the SDK guide under
       //              "Supplying your own fetch".
       //              `manual` over `error` for the credentialed case so the
@@ -495,22 +604,71 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     return init;
   }
 
-  /** Decode and parse frames until the stream ends, aborts, or errors. */
-  private async _pump(body: ReadableStream<Uint8Array>): Promise<void> {
+  /**
+   * Decode and parse frames until the stream ends, aborts, or errors. Returns
+   * whether the connection ended unhealthy: a buffer overflow or a protocol error.
+   */
+  private async _pump(body: ReadableStream<Uint8Array>): Promise<boolean> {
     // Set when the parser reports a buffer overflow: it is terminated at that
     // point, so the read loop must stop rather than feed it again.
     let overflowed = false;
+    // Set by a protocol error: the rest of the chunk is discarded and the
+    // connection reopened, so no later frame is delivered or advances the id.
+    let broken = false;
     const parser = createParser({
       onEvent: (msg) => {
-        if (msg.id) this._lastEventId = msg.id;
-        if (!msg.data) return;
-        // The server announces the column list before the rows that use it,
-        // and again whenever it changes mid-stream.
-        if (msg.event === "schema") {
-          this._applySchema(msg.data);
+        if (broken) return;
+        if (!msg.data) {
+          if (msg.id) this._lastEventId = msg.id;
           return;
         }
-        this._dispatch(msg.data);
+        const kind = msg.event === "schema" ? "schema" : "data";
+        const id = msg.id ?? "";
+        const seq = this._seq[kind]++;
+        // The server announces the column list before the rows that use it,
+        // and again whenever it changes mid-stream.
+        const problem =
+          kind === "schema"
+            ? this._applySchema(msg.data)
+            : this._schemaSkipped
+              ? "The column announcement for these rows was skipped"
+              : this._dispatch(msg.data);
+        if (problem === undefined) {
+          // Only after delivery: a frame that was refused must not move the
+          // resume point past itself, or the reconnect would skip it.
+          if (id) this._lastEventId = id;
+          if (this._suspect?.kind === kind) this._suspect = null;
+          if (kind === "schema") this._schemaSkipped = false;
+          return;
+        }
+        // The same frame failing again after a resume from where it first
+        // failed is the frame, not the connection: skip it, say so once, and
+        // carry on from past it. Either its id matches, or it is the first
+        // frame of its kind on a connection resumed from the same point.
+        const s = this._suspect;
+        const again =
+          s?.kind === kind &&
+          ((id !== "" && id === s.id) || (seq === 0 && s.resumeId === this._lastEventId));
+        if (again || this._schemaSkipped) {
+          this._suspect = null;
+          if (kind === "schema") this._schemaSkipped = true;
+          if (id) this._lastEventId = id;
+          this._emitError({
+            status: 0,
+            code: "SSE_FRAME_DROPPED",
+            message: `Skipped a ${kind} frame${id ? ` (id ${id})` : ""}: ${problem}`,
+            retryable: false,
+          });
+          return;
+        }
+        broken = true;
+        this._suspect = { kind, id, resumeId: this._lastEventId };
+        this._emitError({
+          status: 0,
+          code: "SSE_PROTOCOL_ERROR",
+          message: problem,
+          retryable: true,
+        });
       },
       onRetry: (ms) => {
         this._retryFloorMs = Math.min(Math.max(ms, 0), MAX_BACKOFF_MS);
@@ -533,20 +691,22 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) return;
+        if (done) return false;
         parser.feed(decoder.decode(value, { stream: true }));
         // End the connection on the overflow we just reported, instead of
         // feeding a terminated parser and re-reporting it as a read failure.
-        if (overflowed) return;
+        // A protocol error ends it too, to be reopened from the last delivered id.
+        if (overflowed || broken) return true;
       }
     } catch (e) {
-      if (this._closed) return;
+      if (this._closed) return overflowed || broken;
       this._emitError({
         status: 0,
         code: "SSE_READ_ERROR",
         message: e instanceof Error ? e.message : String(e),
         retryable: true,
       });
+      return overflowed || broken;
     } finally {
       reader.cancel().catch(() => {
         // Already torn down — nothing left to release.
@@ -555,42 +715,42 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
   }
 
   /**
-   * Record the column list an `event: schema` frame announces. Rows that follow
-   * are zipped against it, so a malformed announcement drops the list rather
-   * than keeping a stale one: mislabeling values is worse than delivering none.
+   * Record the column list an `event: schema` frame announces, or say why it
+   * can't be. Rows that follow are zipped against the list, so a malformed
+   * announcement drops it rather than keeping a stale one: mislabeling values
+   * is worse than delivering none. The reason never quotes the frame.
    */
-  private _applySchema(data: string): void {
+  private _applySchema(data: string): string | undefined {
+    this._columns = null;
+    let msg: { columns?: unknown };
     try {
-      const msg = JSON.parse(data) as { table_name?: string; columns?: unknown };
-      if (!Array.isArray(msg.columns) || msg.columns.some((c) => typeof c !== "string")) {
-        throw new Error("columns must be an array of strings");
-      }
-      // A repeated name has no single meaning when the row is zipped into an
-      // object: the later value wins and the earlier one vanishes, with no
-      // signal. Refuse the announcement instead — dropping rows until the next
-      // one is the same failure mode as a malformed frame, and it is loud.
-      if (new Set(msg.columns as string[]).size !== msg.columns.length) {
-        throw new Error("columns contains a duplicate name");
-      }
-      this._columns = msg.columns as string[];
+      msg = JSON.parse(data) as { columns?: unknown };
     } catch {
-      this._columns = null;
-      this._warnBounded(
-        "bad-schema-frame",
-        "[wavehouse] SSE received a malformed schema event:",
-        data,
-      );
+      return "A schema frame is not valid JSON";
     }
+    if (!Array.isArray(msg?.columns) || msg.columns.some((c) => typeof c !== "string")) {
+      return "A schema frame's columns are not an array of strings";
+    }
+    // A repeated name has no single meaning when the row is zipped into an
+    // object: the later value wins and the earlier one vanishes, with no signal.
+    if (new Set(msg.columns as string[]).size !== msg.columns.length) {
+      return "A schema frame names a column twice";
+    }
+    this._columns = msg.columns as string[];
+    return undefined;
   }
 
   /**
-   * Turn one frame's `data` into a StreamEvent.
+   * Turn one frame's `data` into a StreamEvent and deliver it.
    *
    * The row arrives positionally — a JSON array — and is zipped back into an
    * object against the announced column list, so the public API still yields
-   * row objects. A row with no announcement, or one whose length disagrees with
-   * the list, cannot be read: there is no way to say which value is which, so
-   * it is dropped rather than delivered under guessed names.
+   * row objects. A row with no announcement, one that is not an array, or one
+   * whose length disagrees with the list cannot be read: there is no way to say
+   * which value is which, so it is never delivered under guessed names. Those
+   * are protocol errors: the reason is returned, and the caller reopens the
+   * connection from the last delivered event, so the server announces the
+   * columns again. So is a frame that is not valid JSON; the reason never quotes it.
    *
    * Guarded like `_emitError` and `_emitStatus`: `parser.feed()` dispatches
    * every complete frame in a chunk synchronously, so a subscriber that closes
@@ -599,39 +759,26 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
    * delivery on `close()`, and gap-fill replay routinely lands many frames in
    * one chunk.
    */
-  private _dispatch(data: string): void {
-    if (this._closed) return;
+  private _dispatch(data: string): string | undefined {
+    if (this._closed) return undefined;
 
     // Two failures with one culprit each, so they are caught separately: a
     // shared catch blamed the server's frame for an exception thrown by the
     // consumer's own handler, pointing a debugging reader at the wrong side.
-    let event: StreamEvent<T>;
+    let msg: { table_name: string; received_timestamp: string; row: unknown };
     try {
-      const msg = JSON.parse(data) as {
-        table_name: string;
-        received_timestamp: string;
-        row: unknown;
-      };
+      msg = JSON.parse(data);
+    } catch {
+      return "A data frame is not valid JSON";
+    }
+    if (typeof msg !== "object" || msg === null) return "A data frame is not a JSON object";
+    let event: StreamEvent<T>;
+    {
       const columns = this._columns;
-      if (!columns) {
-        this._warnBounded(
-          "no-schema",
-          "[wavehouse] SSE received a row before any schema event:",
-          data,
-        );
-        return;
-      }
-      if (!Array.isArray(msg.row)) {
-        this._warnBounded("row-not-array", "[wavehouse] SSE row is not an array:", data);
-        return;
-      }
+      if (!columns) return "A data frame arrived before any schema frame";
+      if (!Array.isArray(msg.row)) return "A data frame's row is not an array";
       if (msg.row.length !== columns.length) {
-        this._warnBounded(
-          msg.row.length < columns.length ? "row-short" : "row-long",
-          `[wavehouse] SSE row has ${msg.row.length} value(s) but ${columns.length} column(s) were announced:`,
-          data,
-        );
-        return;
+        return `A data frame's row has ${msg.row.length} value(s) but ${columns.length} column(s) were announced`;
       }
       // Null-prototype: a ClickHouse column may legitimately be named
       // `__proto__`, and on a normal object literal that name hits the
@@ -644,9 +791,6 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
         row[columns[i]] = msg.row[i];
       }
       event = { table: msg.table_name, timestamp: msg.received_timestamp, data: row as T };
-    } catch {
-      this._warnBounded("bad-json", "[wavehouse] SSE received malformed message:", data);
-      return; // ignore malformed messages
     }
 
     try {
@@ -654,6 +798,7 @@ export class SSETransport<T = Record<string, unknown>> implements StreamTranspor
     } catch (e) {
       console.error("[wavehouse] SSE event handler threw:", e);
     }
+    return undefined;
   }
 
   /** Suppress callbacks that race a `disconnect()`. */

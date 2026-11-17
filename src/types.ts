@@ -11,13 +11,15 @@ export type Database = Record<string, Record<string, unknown>>;
 
 /**
  * Discriminated union for the async SDK calls that return one. Never throws for
- * anything the server returns; a non-absolute `baseURL` and a rejecting `auth`
- * callback do throw, while a runtime with no `fetch` at all surfaces instead as
- * a retried `NETWORK_ERROR` result.
+ * anything the server returns. A `baseURL` that names no host (a bare path such
+ * as `/api/warehouse`) or carries a query or fragment throws from `createClient`;
+ * a `baseURL` that is otherwise unusable (`https://[`) and a rejecting `auth`
+ * callback throw from the call, while a runtime with no `fetch` at all surfaces
+ * instead as a retried `NETWORK_ERROR` result.
  *
- * `.stream()` and `.liveQuery()` return no `Result` and report the same three
- * differently: a non-absolute `baseURL` reaches the subscriber's `error`
- * callback as a terminal `SSE_CONNECT_ERROR`, a rejecting `auth` as a retryable
+ * `.stream()` and `.liveQuery()` return no `Result` and report the last three
+ * differently: an unusable `baseURL` reaches the subscriber's `error` callback
+ * as a terminal `SSE_CONNECT_ERROR`, a rejecting `auth` as a retryable
  * `SSE_AUTH_ERROR`, and only a missing `fetch` throws from the call itself.
  *
  * Discriminated on `ok`: `if (result.ok)` narrows to the success arm (and tells
@@ -34,13 +36,22 @@ export interface WaveHouseError {
   code: string;
   message: string;
   details?: unknown;
+  /**
+   * On an API answer, the server's own verdict that it is transient, which
+   * `wh.sql()` and pipe calls may carry without the SDK resending them. On a
+   * transport error it is whether this call may be sent again: cleared for a
+   * `wh.sql()` or pipe call whose request may have reached the server.
+   */
   retryable: boolean;
 }
 
 // --- Filter operators ---
 
-/** SDK filter operators (translated to backend equivalents). */
-export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "like" | "not_like";
+/**
+ * SDK filter operators (translated to backend equivalents): the set the
+ * server's structured-query endpoint accepts. There is no negated `like`.
+ */
+export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "like";
 
 // --- Streaming types ---
 
@@ -73,14 +84,26 @@ export interface ClientConfig<_DB extends Database = Database> {
    * ingress; request paths are appended to it. The proxy in front must strip
    * the prefix before forwarding.
    *
-   * Must be **absolute** — scheme and host included. The transports report a
-   * relative value such as "/api/warehouse" differently: a REST call rejects
-   * with a `TypeError` instead of returning a `Result`, while a stream reports
-   * `SSE_CONNECT_ERROR` to the subscriber's `error` callback. Build an absolute
-   * one: `` `${location.origin}/api/warehouse` ``.
+   * Must name a **host**; the scheme may be left off (`http://` for a loopback
+   * host, `https://` otherwise). A bare path such as "/api/warehouse" has no
+   * host, so `createClient` throws a `TypeError` for it, as it does for a query
+   * string or fragment. Build an absolute one:
+   * `` `${location.origin}/api/warehouse` ``. A base that is otherwise unusable
+   * is reported per call: a REST call rejects with a `TypeError`, and a stream
+   * reports `SSE_CONNECT_ERROR` to the subscriber's `error` callback.
    */
   baseURL: string;
-  /** Auth token provider. Omit for public/unauthenticated access. */
+  /**
+   * Auth token provider. Omit for public/unauthenticated access.
+   *
+   * The contract: the SDK calls it **before every attempt** — each retry of a
+   * REST call and each (re)connect of a stream runs it again, so a token that
+   * changed in between is the one sent. It must therefore be cheap: caching,
+   * refreshing and de-duplicating concurrent refreshes are the implementer's
+   * job, not the SDK's. Return an empty string to send no `Authorization`
+   * header. A rejection throws out of a REST call (it is never retried) and is
+   * a retryable `SSE_AUTH_ERROR` on a stream.
+   */
   auth?: () => Promise<string> | string;
   /** Additional client options. */
   options?: ClientOptions;
@@ -101,12 +124,19 @@ export interface ClientConfig<_DB extends Database = Database> {
  *
  * On REST the SDK reads `.ok` and `.headers` always, `.text()` on success, and
  * `.status`, `.statusText` plus `.json()` when the response is not `ok`. A
- * rejection becomes a `NETWORK_ERROR` result and is retried with backoff —
- * unless the `AbortSignal` you passed has been aborted, in which case the
- * result is `ABORTED` and nothing is retried. That is decided from the signal
+ * rejection becomes a `NETWORK_ERROR` result and is retried with backoff on
+ * reads and ingest, but not on raw SQL (`wh.sql()`) or pipe calls, which are
+ * resent only when the connection was certainly never made — unless the
+ * `AbortSignal` you passed has been aborted, in which case the result is
+ * `ABORTED` and nothing is retried. That is decided from the signal
  * rather than the rejection's type, so an implementation that throws something
  * other than a `DOMException` named `AbortError` — `AbortSignal.timeout()`,
  * `node-fetch` — is reported the same way.
+ *
+ * **Honor `init.signal`.** The SDK aborts it to cancel a call or close a stream,
+ * and relies on the rejection or errored body that follows. An implementation
+ * that ignores the signal keeps a request (and, for a stream, a socket) running
+ * after the caller has let go of it.
  *
  * **Streaming needs more.** `.stream()` and `.liveQuery()` read the response as
  * it arrives, via `.body.getReader()`, so an implementation used with them must
@@ -126,9 +156,42 @@ export interface ClientConfig<_DB extends Database = Database> {
  */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * A function form of `options.headers`: called before every attempt and every
+ * stream connect, for credentials that rotate. It follows the contract of
+ * `auth`: it must be cheap, and caching is the implementer's job.
+ */
+export type HeadersProvider = () => Record<string, string> | Promise<Record<string, string>>;
+
 export interface ClientOptions {
-  /** Maximum retry attempts for failed requests. Default: 2. */
+  /** Maximum retry attempts for failed requests: a non-negative integer, else the client throws. Default: 2. */
   maxRetries?: number;
+  /**
+   * A deadline for each attempt on its own, in milliseconds, so a stalled
+   * attempt is retried instead of holding the whole call. Default: off. A
+   * per-call `attemptTimeoutMs` overrides it, and `0` turns it off for that
+   * call.
+   *
+   * It runs from sending the request to the end of the response body, linked to
+   * the caller's `signal`: the caller's own abort still ends the call at once
+   * with `ABORTED` and is never retried. An attempt that hits it is retried
+   * after a backoff while `maxRetries` allows, with the same safety rules as any
+   * network error — `wh.sql()` and pipe calls are not resent once the request
+   * may have been sent, which a timeout always counts as. The call that gives
+   * up returns `ATTEMPT_TIMEOUT`, naming the number of attempts.
+   *
+   * For `.stream()` and `.liveQuery()` it bounds each connect, up to the
+   * response headers, and never an established stream, which is long-lived.
+   */
+  attemptTimeoutMs?: number;
+  /**
+   * Longest `Retry-After` wait, in milliseconds, a REST call will sit through
+   * before resending. It applies to any retryable answer (5xx, 408, 429) the
+   * call may resend; when the server asks for more, the wait is clamped to this
+   * and the call retries while attempts remain. `Retry-After` may be seconds or
+   * an HTTP-date. Default: 30000, the backoff ceiling.
+   */
+  maxRetryAfterMs?: number;
   /**
    * HTTP implementation used for every request, REST and streaming alike.
    * Defaults to the global `fetch`.
@@ -168,7 +231,14 @@ export interface ClientOptions {
    * SDK's own headers: `auth` still owns `Authorization`, and the
    * `Content-Type` and `Accept` a given request needs are not overridable
    * here — a global `Content-Type` that outranked the request's own is a
-   * documented way to break uploads.
+   * documented way to break uploads. Precedence, lowest to highest: these
+   * headers, a per-call `headers`, `auth`'s `Authorization`, then the SDK's own;
+   * a later layer replaces a header of the same name and never joins with it.
+   *
+   * May be a function, for credentials that rotate: it is called before every
+   * attempt and every stream connect, under the same contract as `auth` — it
+   * must be cheap, and caching is yours to do. A rejection throws out of a REST
+   * call, and is a retryable `SSE_AUTH_ERROR` on a stream.
    *
    * In a browser these are subject to CORS: a header outside the safelist adds
    * it to the preflight, which the origin must allow. WaveHouse's own CORS
@@ -176,12 +246,13 @@ export interface ClientOptions {
    * a proxy in front terminates the preflight — which is the deployment they
    * exist for. Server-side callers never preflight.
    */
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | HeadersProvider;
   /**
    * Extra `RequestInit` fields merged into every request — `credentials` for a
    * cookie-authenticated origin, `mode`, `cache`, `keepalive`, or a
    * runtime-specific extension such as Next.js's `next: { tags }`.
    *
+   * A per-call `fetchOptions` is merged over this, field by field (shallowly).
    * Fields the SDK controls (`method`, `headers`, `body`, `signal`) always
    * win, so this cannot corrupt the request itself. Non-standard fields may
    * need a cast, since `RequestInit` only declares the standard ones.
@@ -191,15 +262,17 @@ export interface ClientOptions {
    * would fail cross-origin preflight, and following a redirect would strip the
    * `Authorization` header on a cross-origin hop and silently downgrade the
    * stream to the default role instead of failing. So a request carrying an
-   * `auth` token, or configured `headers` that may hold a proxy secret, refuses
-   * redirects (`SSE_REDIRECT`); without either it follows them, so CDN
-   * canonicalization and an http→https upgrade still work. Note the test is
-   * that concrete pair, not "is this authenticated" — **cookies are invisible
-   * to it**. A cookie is re-derived from the cookie store at each hop rather
-   * than carried, so under the default `same-origin` credentials mode a
-   * redirect keeps the stream authenticated only while the hop stays inside
-   * both the request's origin and the cookie's `Path`; a hop outside either
-   * arrives with no cookie and gets a `default_role` view rather than an error.
+   * `auth` token, configured `headers` that may hold a proxy secret, or (in a
+   * browser) `credentials: "include"` refuses redirects (`SSE_REDIRECT`);
+   * without any of them it follows them, so CDN canonicalization and an
+   * http→https upgrade still work. Cookies relied on through the implicit
+   * `same-origin` default are **invisible to that test**, since that default
+   * cannot be told from a deployment with no cookies. A cookie is re-derived
+   * from the cookie store at each hop rather than carried, so under the default
+   * `same-origin` credentials mode a redirect keeps the stream authenticated
+   * only while the hop stays inside both the request's origin and the cookie's
+   * `Path`; a hop outside either arrives with no cookie and gets a
+   * `default_role` view rather than an error.
    * With `credentials: "include"` the origin half is replaced rather than
    * lifted: ordinary cookie scoping decides, so the cookie crosses a
    * CORS-allowed cross-origin hop only if its own `Domain` covers the target —
@@ -238,7 +311,8 @@ export interface StructuredQuery {
 export interface Aggregation {
   fn: string;
   column: string;
-  alias: string;
+  /** Omitted from the wire when empty; the server then names the column. */
+  alias?: string;
 }
 
 export interface QueryFilter {
@@ -251,6 +325,12 @@ export interface OrderClause {
   column: string;
   dir: "asc" | "desc";
 }
+
+/**
+ * A relative span for `last()`: a number and a unit, such as `"90s"`, `"1h"`,
+ * `"7d"` or `"2w"`. The units are ms, s, m, h, d and w.
+ */
+export type Duration = `${number}${"ms" | "s" | "m" | "h" | "d" | "w"}`;
 
 export interface TimeRange {
   column: string;
@@ -415,8 +495,6 @@ export interface SettingsFinding {
   severity: "error" | "warning";
   /**
    * Settings file the finding is about; absent for directory-level findings.
-   * In a directory of tenant folders it leads with the folder
-   * (`acme/policies.json`).
    */
   file?: string;
   /** Dotted JSON path within the file; absent for whole-file findings. */
@@ -428,10 +506,7 @@ export interface SettingsFinding {
 export interface SettingsReloadResult {
   /**
    * Whether everything the reload covered was adopted; false leaves the
-   * previous settings in effect. Over a directory of tenant folders false can
-   * mean adopted in part: the tenants with an error among their `findings`
-   * were not adopted and are no longer served, and the rest were — `findings`
-   * carries every folder's warnings too.
+   * previous settings in effect.
    */
   adopted: boolean;
   /** Every finding from the validation pass (warnings included on success). */
@@ -441,13 +516,45 @@ export interface SettingsReloadResult {
 // --- Per-call request options ---
 
 /**
+ * What every REST call takes: a signal, and per-call overrides of the client's
+ * `options`.
+ */
+export interface CallOptions {
+  signal?: AbortSignal;
+  /**
+   * This call's own per-attempt deadline in milliseconds, over the client's
+   * `options.attemptTimeoutMs`; `0` switches it off for this call.
+   */
+  attemptTimeoutMs?: number;
+  /**
+   * Headers for this call, over the client's `options.headers` and under
+   * `auth`'s `Authorization` and the SDK's own `Content-Type` and `Accept`.
+   * Matched case-insensitively; a header here replaces the client's of the same
+   * name and is never joined with it.
+   */
+  headers?: Record<string, string>;
+  /**
+   * `RequestInit` fields for this call, merged over the client's
+   * `options.fetchOptions` — Next.js's `next: { tags }` on one query, say.
+   * The fields the SDK controls (`method`, `headers`, `body`, `signal`) still
+   * win.
+   */
+  fetchOptions?: RequestInit;
+  /**
+   * An implementation of `fetch` for this call alone, over `options.fetch` —
+   * a framework's request-scoped `fetch`, such as SvelteKit's `load()` one. The
+   * contract on {@link FetchLike} applies.
+   */
+  fetch?: FetchLike;
+}
+
+/**
  * Options for a single call, passed to `.fetch()`.
  *
  * Note that `await`ing a builder directly (`await wh.from("t").select("*")`)
  * takes no options — use the explicit `.fetch({ … })` form for those.
  */
-export interface RequestOptions {
-  signal?: AbortSignal;
+export interface RequestOptions extends CallOptions {
   limit?: number;
 }
 
@@ -462,29 +569,27 @@ export interface RequestOptions {
  * A pipe's row cap belongs in its SQL as a `{{limit}}` parameter, supplied via
  * `wh.pipe(name, { limit })`.
  */
-export interface PipeRequestOptions {
-  signal?: AbortSignal;
+export interface PipeRequestOptions extends CallOptions {
   /** Not supported on pipes — pass `limit` as a pipe parameter instead. */
   limit?: never;
 }
 
 /**
- * Options for a call to one of the admin routes that address a tenant:
- * `wh.pipes.list()`, `wh.pipes.get()`, `wh.settings.reload()`,
- * `wh.schema.list()`, `wh.schema.refresh()`, `wh.from(t).schema()`,
- * `wh.dlq.list()`, `wh.dlq.table()` and `wh.sql()`.
+ * Options for a call to one of the admin routes: `wh.pipes.list()`,
+ * `wh.pipes.get()`, `wh.settings.reload()`, `wh.schema.list()`,
+ * `wh.schema.refresh()`, `wh.from(t).schema()`, `wh.dlq.list()`,
+ * `wh.dlq.table()` and `wh.sql()`.
  */
-export interface OpsRequestOptions {
-  signal?: AbortSignal;
-  /**
-   * The tenant the call addresses, sent as `?tenant=`. The admin routes ignore
-   * the `X-Tenant-ID` header, so `options.headers` cannot select one. Omitted,
-   * the reads, the refresh and `sql()` serve the default tenant (`0`) and
-   * `reload()` reloads every tenant. An id the server does not accept — the
-   * empty string included — is a `400`, never a silent fallback to the
-   * default.
-   */
-  tenant?: string;
+export type OpsRequestOptions = CallOptions;
+
+/** The server's build, from `GET /version`. */
+export interface VersionInfo {
+  /** The release without its leading "v", or a pseudo-version. */
+  version: string;
+  git_commit: string;
+  build_time: string;
+  /** The server's Go runtime. */
+  go_version: string;
 }
 
 // --- Stream options ---
@@ -492,6 +597,17 @@ export interface OpsRequestOptions {
 export interface StreamOptions {
   since?: string;
   signal?: AbortSignal;
+  /**
+   * Headers for this subscription's connections, over the client's
+   * `options.headers` and under the SDK's own, with the precedence of
+   * {@link CallOptions.headers}.
+   */
+  headers?: Record<string, string>;
+  /**
+   * This subscription's per-attempt deadline for each connect, in milliseconds,
+   * over the client's `options.attemptTimeoutMs`; `0` switches it off.
+   */
+  attemptTimeoutMs?: number;
 }
 
 // --- Internal HTTP context ---
@@ -503,8 +619,10 @@ export interface HttpContext {
   // `fetch` stays optional rather than defaulted here, to keep the global late-bound.
   options: {
     maxRetries: number;
+    maxRetryAfterMs?: number;
+    attemptTimeoutMs?: number;
     fetch?: FetchLike;
-    headers?: Record<string, string>;
+    headers?: Record<string, string> | HeadersProvider;
     fetchOptions?: RequestInit;
   };
 }

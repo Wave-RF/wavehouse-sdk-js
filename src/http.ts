@@ -1,5 +1,11 @@
 import { networkError, parseErrorResponse } from "./errors.js";
-import type { HttpContext, OpsRequestOptions, WaveHouseError } from "./types.js";
+import type {
+  CallOptions,
+  FetchLike,
+  HeadersProvider,
+  HttpContext,
+  WaveHouseError,
+} from "./types.js";
 import { resolveURL } from "./url.js";
 
 interface RequestSpec {
@@ -16,7 +22,23 @@ interface RequestSpec {
   contentType?: string;
   params?: Record<string, string>;
   signal?: AbortSignal;
+  /** Per-call overrides of the client's `options`; see {@link CallOptions}. */
+  attemptTimeoutMs?: number;
+  headers?: Record<string, string>;
+  fetchOptions?: RequestInit;
+  fetch?: FetchLike;
+  /**
+   * How safely a call can be sent twice. `read` (the default, and ingest)
+   * retries; ingest is at-least-once, and a resent batch is only deduplicated
+   * when the server has its `dedupe` setting on and the rows carry an id
+   * field. `sql` and `pipe` may run a write, so they are
+   * resent only when the first attempt certainly did nothing — see `mayResend`.
+   */
+  kind?: CallKind;
 }
+
+/** @internal */
+export type CallKind = "read" | "pipe" | "sql";
 
 /** @internal */
 export interface HttpResult<T> {
@@ -61,15 +83,108 @@ export function mergeHeaders(
 }
 
 /**
- * The `?tenant=` query an admin call sends for `opts.tenant`. An empty string
- * is sent, not dropped: the server refuses it, where dropping it would turn a
- * caller's bug into a call that addresses the default tenant — or, on a
- * reload, every tenant.
+ * Layer header sets, lowest first: a later layer replaces an earlier header of
+ * the same name (case-insensitively, keeping the later spelling) and never
+ * joins with it.
  *
  * @internal
  */
-export function tenantParam(opts?: OpsRequestOptions): Record<string, string> | undefined {
-  return opts?.tenant === undefined ? undefined : { tenant: opts.tenant };
+export function overlayHeaders(
+  ...layers: (Record<string, string> | undefined)[]
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const spelled = new Map<string, string>();
+  for (const layer of layers) {
+    if (!layer) continue;
+    for (const [name, value] of Object.entries(layer)) {
+      const lower = name.toLowerCase();
+      const prior = spelled.get(lower);
+      if (prior !== undefined) delete out[prior];
+      out[name] = value;
+      spelled.set(lower, name);
+    }
+  }
+  return out;
+}
+
+/**
+ * The client's `options.headers`, called afresh when it is a function. Run
+ * before every attempt and every stream connect, so a rotated credential is the
+ * one sent; a rejection propagates like a rejecting `auth`.
+ *
+ * @internal
+ */
+export async function resolveClientHeaders(
+  headers: Record<string, string> | HeadersProvider | undefined,
+): Promise<Record<string, string> | undefined> {
+  return typeof headers === "function" ? await headers() : headers;
+}
+
+/**
+ * The per-call fields of an options object, for spreading into a `RequestSpec`.
+ * Picks fields by name so an options value carrying anything else (`limit`,
+ * say) never leaks into the spec.
+ *
+ * @internal
+ */
+export function callOpts(
+  opts?: CallOptions,
+): Pick<RequestSpec, "signal" | "attemptTimeoutMs" | "headers" | "fetchOptions" | "fetch"> {
+  return {
+    signal: opts?.signal,
+    attemptTimeoutMs: opts?.attemptTimeoutMs,
+    headers: opts?.headers,
+    fetchOptions: opts?.fetchOptions,
+    fetch: opts?.fetch,
+  };
+}
+
+/** A usable per-attempt timeout: a positive finite number of milliseconds. */
+export function attemptTimeout(ms: number | undefined): number | undefined {
+  return typeof ms === "number" && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+/**
+ * One attempt's own deadline, linked to the caller's signal. Firing the timer
+ * aborts `signal` (what `fetch` gets) and rejects `race`, which covers a `fetch`
+ * that ignores its signal; the caller's abort propagates too, so either ends the
+ * attempt, and `timedOut` says which. Without a timeout it is the caller's
+ * signal and a no-op.
+ *
+ * @internal
+ */
+export function attemptGuard(caller: AbortSignal | undefined, ms: number | undefined) {
+  if (ms === undefined) {
+    return {
+      signal: caller,
+      timedOut: false,
+      race: <T>(p: Promise<T>) => p,
+      dispose: () => {},
+    };
+  }
+  const ac = new AbortController();
+  const guard = {
+    signal: ac.signal as AbortSignal | undefined,
+    timedOut: false,
+    race: <T>(p: Promise<T>): Promise<T> => Promise.race([p, rejected]),
+    dispose: () => {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    },
+  };
+  const rejected = new Promise<never>((_, reject) => {
+    ac.signal.addEventListener("abort", () => reject(ac.signal.reason), { once: true });
+  });
+  // Unhandled otherwise: it only rejects when nothing is racing it any more.
+  rejected.catch(() => {});
+  const onCaller = () => ac.abort(caller?.reason);
+  if (caller?.aborted) ac.abort(caller.reason);
+  else caller?.addEventListener("abort", onCaller, { once: true });
+  const timer = setTimeout(() => {
+    guard.timedOut = true;
+    ac.abort(new DOMException(`Attempt timed out after ${ms} ms`, "TimeoutError"));
+  }, ms);
+  return guard;
 }
 
 /** The documented shape for a cancelled request: a Result, never a throw. */
@@ -81,6 +196,85 @@ function abortedResult<T>(): HttpResult<T> {
   };
 }
 
+// Errors from a connection that was never made, so no byte of the request left.
+const NEVER_SENT_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * True only when `fetch` failed before connecting. Node/undici put the system
+ * error on `cause` (an AggregateError of them when several addresses were
+ * tried); a browser's bare TypeError says nothing, so it reads as "may have
+ * been sent".
+ */
+function neverSent(e: unknown): boolean {
+  const seen = new Set<unknown>();
+  const check = (err: unknown): boolean => {
+    if (typeof err !== "object" || err === null || seen.has(err)) return false;
+    seen.add(err);
+    const { code, cause, errors } = err as { code?: unknown; cause?: unknown; errors?: unknown };
+    if (typeof code === "string" && NEVER_SENT_CODES.has(code)) return true;
+    if (Array.isArray(errors) && errors.length > 0 && errors.every(check)) return true;
+    return check(cause);
+  };
+  return check(e);
+}
+
+/**
+ * Whether an error answer may be sent again. A raw SQL statement or a write
+ * pipe may already have run, and a gateway can answer 5xx after it did, so
+ * those resend only on the server's own word that it is safe.
+ */
+function mayResendResponse(kind: CallKind, error: WaveHouseError, res: Response): boolean {
+  if (kind === "read") return true;
+  if (kind === "sql") return false;
+  const body = error.details as { retryable?: unknown } | undefined;
+  const serverSaid = typeof body?.retryable === "boolean";
+  if (serverSaid) return body?.retryable === true;
+  return res.status === 429 || (res.status === 503 && res.headers.has("Retry-After"));
+}
+
+/**
+ * Whether the request holds anything a redirect target must not be handed: a
+ * bearer token, any configured or per-call header, or, in a browser only, an
+ * explicit `credentials: "include"`. Same test as the stream's.
+ */
+function carriesCredential(
+  sdkHeaders: Record<string, string>,
+  clientHeaders: Record<string, string> | undefined,
+  callHeaders: Record<string, string> | undefined,
+  init: RequestInit,
+): boolean {
+  return (
+    sdkHeaders.Authorization !== undefined ||
+    Object.keys(clientHeaders ?? {}).length > 0 ||
+    Object.keys(callHeaders ?? {}).length > 0 ||
+    ("window" in globalThis && init.credentials === "include")
+  );
+}
+
+/** The error for a redirect the SDK did not follow. Never retried. */
+function redirectError(res: Response): WaveHouseError {
+  const location = res.headers.get("Location");
+  const where =
+    res.type === "opaqueredirect"
+      ? "a redirect whose target the browser hides"
+      : `${res.status}${location ? ` to ${location}` : " with no Location"}`;
+  return {
+    status: res.status,
+    code: "REDIRECT",
+    message:
+      `The server answered with ${where}, and the SDK did not follow it: a redirect would forward ` +
+      "this request's credentials and body to the new address. Set `baseURL` to the final URL.",
+    retryable: false,
+  };
+}
+
 /**
  * Internal fetch wrapper with auth injection, retry, backoff, and Retry-After.
  * @internal
@@ -88,7 +282,6 @@ function abortedResult<T>(): HttpResult<T> {
 export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<HttpResult<T>> {
   const url = resolveURL(ctx.baseURL, opts.path, opts.params).toString();
   const headers: Record<string, string> = {
-    "Content-Type": opts.contentType ?? "application/json",
     Accept: "application/json",
   };
 
@@ -100,59 +293,115 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         ? JSON.stringify(opts.body)
         : undefined;
 
-  if (ctx.auth) {
-    const token = await ctx.auth();
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
-    }
+  // Only a request with a body describes one. On a bodyless GET the header
+  // would also make a cross-origin browser read preflight, since
+  // application/json is not a CORS-safelisted Content-Type.
+  if (requestBody !== undefined) {
+    headers["Content-Type"] = opts.contentType ?? "application/json";
   }
 
-  // After auth, so `auth` keeps ownership of Authorization, and after the
-  // Content-Type/Accept this request needs.
-  const finalHeaders = mergeHeaders(headers, ctx.options.headers);
-
+  const kind = opts.kind ?? "read";
   let lastError: WaveHouseError | null = null;
-  const maxAttempts = ctx.options.maxRetries + 1;
+  // At least one attempt, so a bad count can never skip the loop.
+  const retries = ctx.options.maxRetries;
+  const maxAttempts = Number.isInteger(retries) && retries > 0 ? retries + 1 : 1;
+
+  const timeoutMs = attemptTimeout(opts.attemptTimeoutMs ?? ctx.options.attemptTimeoutMs);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Resolved before every attempt, not once per call: a token or a rotating
+    // header that changed during a backoff is the one a retry sends. Both run
+    // outside the `try` below, so a rejection throws out of `request` as it
+    // always has instead of being retried as a network error.
+    // `auth` goes first, and is called synchronously on the first attempt: a
+    // liveQuery depends on which of the stream and the backfill reaches it first.
+    const sdkHeaders = { ...headers };
+    if (ctx.auth) {
+      const token = await ctx.auth();
+      if (token) {
+        sdkHeaders.Authorization = `Bearer ${token}`;
+      }
+    }
+    const clientHeaders = await resolveClientHeaders(ctx.options.headers);
+    // Lowest to highest: client headers, per-call headers, `auth`'s
+    // Authorization, then the SDK's own (the Content-Type and Accept this
+    // request needs). `mergeHeaders` keeps the SDK's names out of the way.
+    const finalHeaders = mergeHeaders(sdkHeaders, overlayHeaders(clientHeaders, opts.headers));
+
+    const guard = attemptGuard(opts.signal, timeoutMs);
     try {
-      // Configured RequestInit first, so the fields the SDK controls overwrite
-      // it — a supplied `method` or `body` would otherwise corrupt the request.
+      // Configured RequestInit first, then the call's, so the fields the SDK
+      // controls overwrite both — a supplied `method` or `body` would
+      // otherwise corrupt the request.
       const init: RequestInit = {
         ...ctx.options.fetchOptions,
+        ...opts.fetchOptions,
         method: opts.method,
         headers: finalHeaders,
         body: requestBody,
-        signal: opts.signal,
+        signal: guard.signal,
       };
+      // A redirect forwards custom headers (and a body) to wherever it points,
+      // and a re-sent write could run twice. With any credential on the
+      // request, report the redirect instead of following it. Without one,
+      // `fetch` is left to follow.
+      if (carriesCredential(sdkHeaders, clientHeaders, opts.headers, init)) {
+        init.redirect = "manual";
+      }
       // Call the global directly when no override is configured, rather than
       // capturing it — a detached `fetch` reference is not universally safe to
       // invoke, and late binding is what lets tests swap `globalThis.fetch`.
-      const doFetch = ctx.options.fetch;
-      const res = doFetch ? await doFetch(url, init) : await fetch(url, init);
+      const doFetch = opts.fetch ?? ctx.options.fetch;
+      const res = await guard.race(doFetch ? doFetch(url, init) : fetch(url, init));
 
-      if (res.ok) {
-        const text = await res.text();
-        const data = text ? (JSON.parse(text) as T) : (undefined as T);
-        return { data, error: null, headers: res.headers };
+      // `manual` surfaces the raw 3xx in Node and an `opaqueredirect` with
+      // status 0 in a browser, which hides the Location; both are the same error.
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        void res.body?.cancel().catch(() => {});
+        return { data: null, error: redirectError(res), headers: res.headers };
       }
 
-      const error = await parseErrorResponse(res);
-
-      // 503 with Retry-After: wait the specified duration
-      if (res.status === 503) {
-        const retryAfter = res.headers.get("Retry-After");
-        if (retryAfter && attempt < maxAttempts - 1) {
-          const delay = parseInt(retryAfter, 10) * 1000 || 30_000;
-          await sleep(delay, opts.signal);
-          lastError = error;
-          continue;
+      if (res.ok) {
+        const text = await guard.race(res.text());
+        if (!text) return { data: undefined as T, error: null, headers: res.headers };
+        // Outside the network catch below: a body that is not JSON (an
+        // intermediary's HTML page, say) is a definite answer, so resending it
+        // would only repeat the request, a write included.
+        try {
+          return { data: JSON.parse(text) as T, error: null, headers: res.headers };
+        } catch {
+          return {
+            data: null,
+            error: {
+              status: res.status,
+              code: "DECODE_ERROR",
+              message: `The server answered ${res.status} with a body that is not valid JSON`,
+              retryable: false,
+            },
+            headers: res.headers,
+          };
         }
       }
 
-      // Retryable server errors (5xx)
+      const error = await guard.race(parseErrorResponse(res));
+
+      if (!mayResendResponse(kind, error, res)) {
+        return { data: null, error, headers: res.headers };
+      }
+
+      // Retryable answers (5xx, 408, 429, or what the server marks retryable)
+      // wait the server's `Retry-After` when it sends one, clamped to
+      // `maxRetryAfterMs`, as `wavehouse-sdk-go` does: a long ask is shortened,
+      // not turned into an error. Calls that may have written never get here
+      // unless `mayResendResponse` said so.
       if (error.retryable && attempt < maxAttempts - 1) {
-        await sleep(backoff(attempt), opts.signal);
+        const asked = parseRetryAfter(res.headers.get("Retry-After"), Date.now());
+        const cap = ctx.options.maxRetryAfterMs ?? MAX_BACKOFF_MS;
+        guard.dispose();
+        await sleep(
+          asked === undefined ? backoff(attempt) : jitter(Math.min(asked, cap)),
+          opts.signal,
+        );
         lastError = error;
         continue;
       }
@@ -175,13 +424,22 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
         return abortedResult<T>();
       }
 
-      lastError = networkError(e);
+      lastError = guard.timedOut
+        ? attemptTimeoutError(timeoutMs ?? 0, attempt + 1)
+        : networkError(e);
+      // The request may have reached the server; resending could run it twice.
+      // Reported as not retryable too: `retryable` tells the caller a resend is safe.
+      if (kind !== "read" && !neverSent(e)) {
+        lastError = { ...lastError, retryable: false };
+        break;
+      }
       if (attempt < maxAttempts - 1) {
         // This sleep is the one that runs inside the catch, so unlike the two
         // in the try above, an abort raised *by* the backoff would escape
         // `request()` as a raw DOMException instead of the documented ABORTED
         // result — and no caller wraps this, so it would reach the consumer as
         // an unhandled rejection.
+        guard.dispose();
         try {
           await sleep(backoff(attempt), opts.signal);
         } catch (abort) {
@@ -193,14 +451,63 @@ export async function request<T>(ctx: HttpContext, opts: RequestSpec): Promise<H
           throw abort;
         }
       }
+    } finally {
+      guard.dispose();
     }
   }
 
-  return { data: null, error: lastError!, headers: new Headers() };
+  return {
+    data: null,
+    error: lastError ?? {
+      status: 0,
+      code: "NETWORK_ERROR",
+      message: "No request attempt was made",
+      retryable: false,
+    },
+    headers: new Headers(),
+  };
 }
 
+/**
+ * What a call ends with when its last attempt hit `attemptTimeoutMs`. Not a
+ * caller abort (that is `ABORTED`), and it says how many attempts were made.
+ * Retryable here; the catch below clears that for a call that may have written.
+ */
+function attemptTimeoutError(ms: number, attempts: number): WaveHouseError {
+  return {
+    status: 0,
+    code: "ATTEMPT_TIMEOUT",
+    message: `Attempt timeout: no complete response within ${ms} ms, after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
+    retryable: true,
+  };
+}
+
+const MAX_BACKOFF_MS = 30_000;
+
 function backoff(attempt: number): number {
-  return Math.min(1000 * 2 ** attempt, 30_000);
+  return Math.min(1000 * 2 ** attempt, MAX_BACKOFF_MS);
+}
+
+/** Spread clients that were told the same wait; never earlier than asked. */
+function jitter(ms: number): number {
+  return ms + Math.random() * (0.2 * ms + 100);
+}
+
+/**
+ * A `Retry-After` value in milliseconds: delta-seconds or an HTTP-date (a date
+ * already past is 0, "retry now"). Undefined when absent or unparseable, which
+ * the caller reads as "no usable hint, back off normally".
+ *
+ * @internal
+ */
+export function parseRetryAfter(value: string | null, now: number): number | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  // Date.parse reads "1.5" or "-3" as some year; an HTTP-date names a month.
+  if (!/[A-Za-z]/.test(v)) return undefined;
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -209,14 +516,16 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       reject(new DOMException("Aborted", "AbortError"));
       return;
     }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(new DOMException("Aborted", "AbortError"));
-      },
-      { once: true },
-    );
+    // `{ once: true }` only removes the listener after it fires; when the timer
+    // wins it must come off by hand, or a long-lived signal collects one per wait.
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

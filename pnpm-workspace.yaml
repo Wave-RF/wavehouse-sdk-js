@@ -6,6 +6,10 @@ packages:
 # esbuild (via tsup and vitest) ships a postinstall binary.
 allowBuilds:
   esbuild: true
+  # testcontainers' optional native accelerators; the pure-JS fallbacks are fine for tests.
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
 
 minimumReleaseAge: 10080
 

@@ -159,6 +159,20 @@ describe("SSETransport request construction", () => {
     t.disconnect();
   });
 
+  it("sends a caller's X-Trace-Id header unchanged", async () => {
+    const f = makeFetch();
+    const t = new SSETransport({
+      baseURL: BASE,
+      table: "clicks",
+      headers: { "X-Trace-Id": "abc" },
+      fetch: f.impl,
+    });
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    expect(headersOf(f.attempts[0])["X-Trace-Id"]).toBe("abc");
+    t.disconnect();
+  });
+
   it("refuses redirects once a credential is attached", async () => {
     const f = makeFetch();
     const t = new SSETransport({
@@ -174,6 +188,51 @@ describe("SSETransport request construction", () => {
     // Authorization is stripped, so a secret would land wherever it points.
     expect(f.attempts[0].init.redirect).toBe("manual");
     t.disconnect();
+  });
+
+  describe("redirect policy by credential", () => {
+    const cases: Array<{
+      name: string;
+      opts: Record<string, unknown>;
+      browser: boolean;
+      redirect: string;
+    }> = [
+      { name: "nothing", opts: {}, browser: true, redirect: "follow" },
+      { name: "a bearer token", opts: { auth: () => "t" }, browser: false, redirect: "manual" },
+      {
+        name: "configured headers",
+        opts: { headers: { "X-Key": "k" } },
+        browser: false,
+        redirect: "manual",
+      },
+      {
+        name: "credentials include in a browser",
+        opts: { fetchOptions: { credentials: "include" } },
+        browser: true,
+        redirect: "manual",
+      },
+      {
+        name: "credentials include outside a browser",
+        opts: { fetchOptions: { credentials: "include" } },
+        browser: false,
+        redirect: "follow",
+      },
+      {
+        name: "credentials same-origin in a browser",
+        opts: { fetchOptions: { credentials: "same-origin" } },
+        browser: true,
+        redirect: "follow",
+      },
+    ];
+    it.each(cases)("$name -> $redirect", async ({ opts, browser, redirect }) => {
+      if (browser) vi.stubGlobal("window", {});
+      const f = makeFetch();
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl, ...opts });
+      t.connect();
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+      expect(f.attempts[0].init.redirect).toBe(redirect);
+      t.disconnect();
+    });
   });
 
   it("neutralizes a body from fetchOptions", async () => {
@@ -314,25 +373,6 @@ describe("SSETransport framing", () => {
     expect(seen.events[0].data).toEqual({ split: true });
     t.disconnect();
   });
-
-  it("warns on a malformed payload without emitting or erroring", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
-
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
-
-    conn.push("id: x\ndata: {not json\n\n");
-    await vi.waitFor(() => expect(warn).toHaveBeenCalled());
-
-    expect(seen.events).toHaveLength(0);
-    expect(seen.errors).toHaveLength(0);
-    t.disconnect();
-  });
 });
 
 describe("SSETransport positional rows", () => {
@@ -387,152 +427,147 @@ describe("SSETransport positional rows", () => {
     t.disconnect();
   });
 
-  it("drops a row it has no column list for rather than guessing", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
+  describe("protocol errors reconnect from the last delivered id", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
 
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
+    /** One connection that delivers a first good row, then `bad`, then a good row it must not deliver. */
+    async function brokenConnection(bad: string) {
+      const f = makeFetch();
+      const first = streamingResponse();
+      const second = streamingResponse();
+      f.queue.push(
+        () => first.res,
+        () => second.res,
+      );
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    conn.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["/a"] }));
-    await flush();
-
-    expect(seen.events).toHaveLength(0);
-    expect(seen.errors).toHaveLength(0);
-    expect(warn).toHaveBeenCalled();
-
-    // The stream keeps going: the announcement arrives and rows flow again.
-    conn.push(schemaFrame(["page"]));
-    conn.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b"] }));
-    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
-    expect(seen.events[0].data).toEqual({ page: "/b" });
-
-    t.disconnect();
-    warn.mockRestore();
-  });
-
-  it("drops a row whose length disagrees with the announced columns", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
-
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
-
-    conn.push(schemaFrame(["page", "country"]));
-    // Too short and too long are the same class of bug: there is no way to say
-    // which value is which, so neither is delivered under guessed names.
-    conn.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["/a"] }));
-    conn.push(
-      frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/a", "US", "extra"] }),
-    );
-    conn.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: "not-an-array" }));
-    await flush();
-
-    expect(seen.events).toHaveLength(0);
-    expect(warn).toHaveBeenCalledTimes(3);
-    t.disconnect();
-    warn.mockRestore();
-  });
-
-  it("bounds skew warnings per cause instead of one per row", async () => {
-    // A server that predates the positional wire sends every row with no schema
-    // event, so the unbounded warn was one console line per row for the whole
-    // connection. The volume is bounded, but per CAUSE — a flat boolean would
-    // have hidden the short/long/non-array cases behind whichever fired first.
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
-
-    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
-    const seen = collect(t);
-    t.connect();
-    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
-
-    // No schema frame at all — 10 rows, one cause.
-    for (let i = 0; i < 10; i++) {
-      conn.push(frame(`t${i}`, { table_name: "clicks", received_timestamp: `t${i}`, row: ["/a"] }));
+      first.push(rowFrames("t1", "t1", { page: "/a", country: "US" }));
+      await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+      // The bad frame and a good one in the same chunk: nothing after the bad
+      // one on this connection may be delivered or move the resume point.
+      first.push(
+        bad + frame("t3", { table_name: "clicks", received_timestamp: "t3", row: ["/c", "FR"] }),
+      );
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      return { f, t, seen, second };
     }
-    await flush();
 
-    expect(seen.events).toHaveLength(0);
-    // 3 warnings + 1 "further occurrences suppressed", not 10.
-    expect(warn).toHaveBeenCalledTimes(4);
-    expect(String(warn.mock.calls[3][0])).toContain("suppressed");
+    it("reconnects on a row with fewer values than announced columns", async () => {
+      const { f, t, seen } = await brokenConnection(
+        frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b"] }),
+      );
+      expect(seen.errors[0]).toMatchObject({ code: "SSE_PROTOCOL_ERROR", retryable: true });
+      expect(seen.errors[0].message).toContain("1 value(s) but 2 column(s)");
+      expect(seen.events).toHaveLength(1);
+      // The refused frame, and the good one behind it, did not move the resume point.
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+      t.disconnect();
+    });
 
-    // A DIFFERENT cause still gets its own budget — the point of keying by cause.
-    warn.mockClear();
-    conn.push(schemaFrame(["page", "country"]));
-    conn.push(frame("s1", { table_name: "clicks", received_timestamp: "s1", row: ["/a"] }));
-    await flush();
-    expect(warn).toHaveBeenCalledTimes(1);
+    it("reconnects on a row with more values than announced columns", async () => {
+      const { f, t, seen } = await brokenConnection(
+        frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b", "US", "x"] }),
+      );
+      expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
+      expect(seen.events).toHaveLength(1);
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+      t.disconnect();
+    });
 
-    // The two non-skew causes are bounded on the same budget. Both flood
-    // identically against a bad server, and sdk/reference.md states the bound as
-    // a contract for every cause — so each needs its own case, or reverting the
-    // bound breaks nothing.
-    warn.mockClear();
-    for (let i = 0; i < 10; i++) {
-      conn.push(`event: schema\ndata: {"table_name":"clicks","columns":"not-an-array"}\n\n`);
-    }
-    await flush();
-    expect(warn).toHaveBeenCalledTimes(4);
-    expect(String(warn.mock.calls[3][0])).toContain("suppressed");
+    it("reconnects on a row that is not an array", async () => {
+      const { f, t, seen } = await brokenConnection(
+        frame("t2", { table_name: "clicks", received_timestamp: "t2", row: "not-an-array" }),
+      );
+      expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+      t.disconnect();
+    });
 
-    warn.mockClear();
-    for (let i = 0; i < 10; i++) {
-      conn.push(`data: {not json\n\n`);
-    }
-    await flush();
-    expect(warn).toHaveBeenCalledTimes(4);
-    expect(String(warn.mock.calls[3][0])).toContain("suppressed");
+    it("treats a data frame before any schema frame as a protocol error, even an empty row", async () => {
+      const f = makeFetch();
+      const first = streamingResponse();
+      const second = streamingResponse();
+      f.queue.push(
+        () => first.res,
+        () => second.res,
+      );
+      const t = new SSETransport({
+        baseURL: BASE,
+        table: "clicks",
+        since: "2026-08-01T00:00:00Z",
+        fetch: f.impl,
+      });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    t.disconnect();
-    warn.mockRestore();
+      first.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: [] }));
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      expect(seen.errors[0]).toMatchObject({ code: "SSE_PROTOCOL_ERROR", retryable: true });
+      expect(seen.events).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      // Nothing was delivered, so the reconnect resumes from `since`, not from an id it never had.
+      expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
+      expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:00Z");
+
+      // The new connection announces its columns first, and rows flow again.
+      second.push(rowFrames("t2", "t2", { page: "/b" }));
+      await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+      expect(seen.events[0].data).toEqual({ page: "/b" });
+      t.disconnect();
+    });
   });
 
   it("refuses a schema frame that names a column twice", async () => {
     // Zipping a positional row against a duplicate name keeps the later value
     // and drops the earlier one, with no signal. Refusing the announcement is
-    // the loud failure: rows drop until the next valid one.
+    // the loud failure: the rows behind it are a protocol error, and the
+    // connection reopens to have the columns announced again.
+    vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const f = makeFetch();
-    const conn = streamingResponse();
-    f.queue.push(() => conn.res);
+    const first = streamingResponse();
+    const second = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+    );
 
     const t2 = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
     const seen = collect(t2);
     t2.connect();
     await vi.waitFor(() => expect(seen.statuses).toContain("live"));
 
-    conn.push(schemaFrame(["tenant", "tenant"]));
-    conn.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["a", "b"] }));
-    await flush();
+    first.push(schemaFrame(["dup", "dup"]));
+    first.push(frame("t1", { table_name: "clicks", received_timestamp: "t1", row: ["a", "b"] }));
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
 
     expect(seen.events).toHaveLength(0);
-    expect(warn).toHaveBeenCalled();
+    expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
 
-    // A valid announcement afterwards recovers the stream.
-    conn.push(schemaFrame(["page", "button"]));
-    conn.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/a", "go"] }));
-    await flush();
-    expect(seen.events).toHaveLength(1);
+    // A valid announcement on the new connection recovers the stream.
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    second.push(schemaFrame(["page", "button"]));
+    second.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/a", "go"] }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
     expect(seen.events[0].data).toEqual({ page: "/a", button: "go" });
 
     t2.disconnect();
     warn.mockRestore();
   });
 
-  it("drops a malformed schema event rather than keeping a stale column list", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("refuses a malformed schema event rather than keeping a stale column list", async () => {
+    vi.useFakeTimers();
     const f = makeFetch();
     const conn = streamingResponse();
     f.queue.push(() => conn.res);
@@ -550,12 +585,123 @@ describe("SSETransport positional rows", () => {
     // names the server no longer claims — worse than delivering nothing.
     conn.push(`event: schema\ndata: {"table_name":"clicks","columns":"nope"}\n\n`);
     conn.push(frame("t2", { table_name: "clicks", received_timestamp: "t2", row: ["/b"] }));
-    await flush();
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
 
+    expect(seen.errors[0].code).toBe("SSE_PROTOCOL_ERROR");
     expect(seen.events).toHaveLength(1);
-    expect(warn).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
     t.disconnect();
-    warn.mockRestore();
+  });
+});
+
+describe("SSETransport frames that cannot be decoded", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  /** Two connections; `badFrame` is pushed on the first after a delivered row `t1`. */
+  async function setup() {
+    const f = makeFetch();
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const third = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+      () => third.res,
+    );
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(seen.statuses).toContain("live"));
+    first.push(rowFrames("t1", "t1", { page: "/a" }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+    return { f, t, seen, first, second, third };
+  }
+  const reconnect = async (f: ReturnType<typeof makeFetch>, n: number) => {
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(n));
+  };
+
+  it("reconnects from the last delivered id on invalid JSON, and delivers the frame once it decodes", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push("id: t2\ndata: {not json\n\n");
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    expect(seen.errors[0]).toMatchObject({ code: "SSE_PROTOCOL_ERROR", retryable: true });
+    expect(seen.errors[0].message).not.toContain("not json");
+
+    await reconnect(f, 2);
+    // The refused frame did not move the resume point past itself.
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+    second.push(rowFrames("t2", "t2", { page: "/b" }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+    expect(seen.events[1].data).toEqual({ page: "/b" });
+    expect(seen.errors.map((e) => e.code)).toEqual(["SSE_PROTOCOL_ERROR"]);
+    t.disconnect();
+  });
+
+  it("skips a frame that fails again after the reconnect, with one drop error, and goes on", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push("id: t2\ndata: {not json secret-payload\n\n");
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    await reconnect(f, 2);
+
+    second.push(schemaFrame(["page"]));
+    second.push("id: t2\ndata: {not json secret-payload\n\n");
+    second.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: ["/c"] }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+
+    // Still the same connection: no third attempt.
+    expect(f.attempts).toHaveLength(2);
+    expect(seen.events[1].data).toEqual({ page: "/c" });
+    expect(seen.errors.map((e) => e.code)).toEqual(["SSE_PROTOCOL_ERROR", "SSE_FRAME_DROPPED"]);
+    const drop = seen.errors[1];
+    expect(drop.retryable).toBe(false);
+    expect(drop.message).toContain("t2");
+    expect(drop.message).toContain("not valid JSON");
+    expect(drop.message).not.toContain("secret-payload");
+
+    // The resume point is now past the skipped frame.
+    second.close();
+    await reconnect(f, 3);
+    expect(headersOf(f.attempts[2])["Last-Event-ID"]).toBe("t3");
+    t.disconnect();
+  });
+
+  it("skips a frame with no id that is the first data frame after resuming from the same point", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push("data: {bad\n\n");
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    await reconnect(f, 2);
+    second.push(schemaFrame(["page"]));
+    second.push("data: {bad\n\n");
+    second.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: ["/c"] }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(2));
+    expect(seen.errors.map((e) => e.code)).toEqual(["SSE_PROTOCOL_ERROR", "SSE_FRAME_DROPPED"]);
+    t.disconnect();
+  });
+
+  it("treats a schema frame with a duplicate column the same way", async () => {
+    const { f, t, seen, first, second } = await setup();
+    first.push('id: s2\nevent: schema\ndata: {"columns":["a","a"]}\n\n');
+    await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+    await reconnect(f, 2);
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("t1");
+
+    second.push('id: s2\nevent: schema\ndata: {"columns":["a","a"]}\n\n');
+    second.push(frame("t3", { table_name: "clicks", received_timestamp: "t3", row: [1, 2] }));
+    await vi.waitFor(() => expect(seen.errors.length).toBeGreaterThanOrEqual(3));
+    // The schema is skipped once; rows that cannot be read are skipped, never delivered mislabeled.
+    expect(seen.errors.map((e) => e.code)).toEqual([
+      "SSE_PROTOCOL_ERROR",
+      "SSE_FRAME_DROPPED",
+      "SSE_FRAME_DROPPED",
+    ]);
+    expect(seen.events).toHaveLength(1);
+    expect(f.attempts).toHaveLength(2);
+    t.disconnect();
   });
 });
 
@@ -597,6 +743,7 @@ describe("SSETransport reconnect and resumption", () => {
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
 
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBeNull();
     expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:03Z");
     expect(headersOf(f.attempts[1]).Authorization).toBe("Bearer token-2");
     expect(seen.statuses).toContain("reconnecting");
@@ -746,6 +893,52 @@ describe("SSETransport reconnect and resumption", () => {
     t.disconnect();
   });
 
+  it("backs off across repeated overflows even when each connection ran past the stable window", async () => {
+    const f = makeFetch();
+    const first = streamingResponse();
+    const second = streamingResponse();
+    const third = streamingResponse();
+    f.queue.push(
+      () => first.res,
+      () => second.res,
+      () => third.res,
+    );
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+
+    // Held long enough to count as healthy, then overflows: the first wait is
+    // the schedule's first step (500-1000ms)...
+    await vi.advanceTimersByTimeAsync(4000);
+    first.push(`data: ${"x".repeat(MAX_BUFFER_CHARS)}`);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.attempts).toHaveLength(2);
+
+    // ...and the second must not start over: it is the next step (1000-2000ms).
+    await vi.advanceTimersByTimeAsync(4000);
+    second.push(`data: ${"x".repeat(MAX_BUFFER_CHARS)}`);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(f.attempts).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(f.attempts).toHaveLength(3);
+    t.disconnect();
+  });
+
+  it("does not open a connection when disconnect() lands while a signal-ignoring fetch resolves", async () => {
+    let release!: (r: Response) => void;
+    const body = streamingResponse();
+    const impl: FetchLike = () => new Promise<Response>((r) => (release = r));
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: impl });
+    const seen = collect(t);
+    t.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    t.disconnect();
+    release(body.res);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(seen.statuses).toEqual(["closed"]);
+  });
+
   it("retries an AbortError from a custom fetch that the SDK did not raise", async () => {
     const f = makeFetch();
     // The motivating case: an `options.fetch` enforcing its own per-attempt
@@ -824,6 +1017,7 @@ describe("SSETransport reconnect and resumption", () => {
 
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBeNull();
     expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
 
     t.disconnect();
@@ -860,6 +1054,125 @@ describe("SSETransport reconnect and resumption", () => {
     await vi.waitFor(() => expect(f.attempts.length).toBeGreaterThan(1));
 
     t.disconnect();
+  });
+
+  describe("429 and Retry-After", () => {
+    /** Run one rejected attempt and return how many attempts exist after `ms`. */
+    async function attemptsAfter(res: () => Response, waits: number[]) {
+      const f = makeFetch();
+      f.queue.push(res);
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      const seen = collect(t);
+      t.connect();
+      await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
+      // `waitFor` above already advanced the fake clock a little, so every
+      // boundary below keeps a second's margin either side of the deadline.
+      const counts: number[] = [];
+      const statuses = [...seen.statuses];
+      for (const w of waits) {
+        await vi.advanceTimersByTimeAsync(w);
+        counts.push(f.attempts.length);
+      }
+      statuses.push(...seen.statuses.slice(statuses.length));
+      t.disconnect();
+      return { counts, seen: { ...seen, statuses } };
+    }
+
+    it("retries a 429 instead of ending the stream", async () => {
+      const { counts, seen } = await attemptsAfter(
+        () => new Response("{}", { status: 429 }),
+        [2000],
+      );
+      expect(seen.errors[0].status).toBe(429);
+      expect(seen.errors[0].retryable).toBe(true);
+      expect(seen.statuses).not.toContain("closed");
+      expect(counts[0]).toBe(2);
+    });
+
+    it("keeps a 429 terminal when the body says it is not retryable", async () => {
+      const { counts, seen } = await attemptsAfter(
+        () => new Response(JSON.stringify({ retryable: false }), { status: 429 }),
+        [60_000],
+      );
+      expect(seen.errors[0].retryable).toBe(false);
+      expect(counts[0]).toBe(1);
+    });
+
+    it.each([400, 401, 403, 404, 405, 410, 413])("keeps a %i terminal", async (status) => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status, headers: { "Retry-After": "1" } }),
+        [60_000],
+      );
+      expect(counts[0]).toBe(1);
+    });
+
+    it("re-dials a 408, which is retryable", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 408, headers: { "Retry-After": "20" } }),
+        [19_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("waits Retry-After seconds before re-dialing a 429", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": "20" } }),
+        [19_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("waits Retry-After on a 503 too", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 503, headers: { "Retry-After": "12" } }),
+        [11_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("reads Retry-After as an HTTP-date", async () => {
+      vi.setSystemTime(new Date("2026-08-01T00:00:00.000Z"));
+      const { counts } = await attemptsAfter(
+        () =>
+          new Response("{}", {
+            status: 429,
+            headers: { "Retry-After": new Date("2026-08-01T00:00:15Z").toUTCString() },
+          }),
+        [14_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it("clamps an enormous Retry-After to the 30s ceiling", async () => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": "86400" } }),
+        [29_000, 1_500],
+      );
+      expect(counts).toEqual([1, 2]);
+    });
+
+    it.each(["soon", "-5", "0", ""])("ignores an unusable Retry-After %j", async (value) => {
+      const { counts } = await attemptsAfter(
+        () => new Response("{}", { status: 429, headers: { "Retry-After": value } }),
+        [1000, 1000],
+      );
+      expect(counts[1]).toBe(2);
+    });
+
+    it("applies Retry-After to one wait only", async () => {
+      const f = makeFetch();
+      f.queue.push(() => new Response("{}", { status: 429, headers: { "Retry-After": "20" } }));
+      f.queue.push(() => new Response("{}", { status: 429 }));
+      const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+      collect(t);
+      t.connect();
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+      // The second wait is the schedule's own (attempt 1: at most 2s), not 20s.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.attempts).toHaveLength(3);
+      t.disconnect();
+    });
   });
 
   it("retries when the connection itself fails", async () => {
@@ -985,7 +1298,7 @@ describe("SSETransport lifecycle", () => {
   it("ends the stream on a baseURL that cannot resolve", async () => {
     vi.useFakeTimers();
     const f = makeFetch();
-    const t = new SSETransport({ baseURL: "not-a-url", table: "clicks", fetch: f.impl });
+    const t = new SSETransport({ baseURL: "https://[", table: "clicks", fetch: f.impl });
     const seen = collect(t);
     t.connect();
     await vi.waitFor(() => expect(seen.errors).toHaveLength(1));
@@ -1398,5 +1711,99 @@ describe("SSETransport hostile column names", () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
 
     t.disconnect();
+  });
+});
+
+describe("SSETransport early reconnect", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  /** A live connection whose response carries the given headers. */
+  function liveWith(headers: Record<string, string>) {
+    const s = streamingResponse();
+    const res = new Response(s.res.body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream", ...headers },
+    });
+    return { ...s, res };
+  }
+
+  it("resumes from the first connection's Date header when no event arrived", async () => {
+    const f = makeFetch();
+    const first = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
+    f.queue.push(() => first.res);
+
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    expect(new URL(f.attempts[0].url).searchParams.get("since")).toBeNull();
+
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-08-01T00:00:07.000Z");
+    expect(headersOf(f.attempts[1])["Last-Event-ID"]).toBeUndefined();
+    t.disconnect();
+  });
+
+  it("falls back to local time less 5s without a Date header", async () => {
+    vi.setSystemTime(new Date("2026-08-01T00:01:00Z"));
+    const f = makeFetch();
+    const first = liveWith({});
+    f.queue.push(() => first.res);
+
+    const t = new SSETransport({ baseURL: BASE, table: "clicks", fetch: f.impl });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+
+    // The fake clock advances a little before the connection goes live.
+    const since = new URL(f.attempts[1].url).searchParams.get("since") ?? "";
+    expect(Date.parse(since) - Date.parse("2026-08-01T00:00:55Z")).toBeLessThan(1000);
+    expect(Date.parse(since)).toBeGreaterThanOrEqual(Date.parse("2026-08-01T00:00:55Z"));
+    t.disconnect();
+  });
+
+  it("keeps the caller's since, and resumes from the last event id once one arrived", async () => {
+    const f = makeFetch();
+    const first = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
+    f.queue.push(() => first.res);
+
+    const t = new SSETransport({
+      baseURL: BASE,
+      table: "clicks",
+      since: "2026-07-01T00:00:00Z",
+      fetch: f.impl,
+    });
+    collect(t);
+    t.connect();
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(1));
+    first.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(f.attempts).toHaveLength(2));
+    expect(new URL(f.attempts[1].url).searchParams.get("since")).toBe("2026-07-01T00:00:00Z");
+    t.disconnect();
+
+    const g = makeFetch();
+    const one = liveWith({ Date: "Sat, 01 Aug 2026 00:00:07 GMT" });
+    g.queue.push(() => one.res);
+    const t2 = new SSETransport({ baseURL: BASE, table: "clicks", fetch: g.impl });
+    const seen = collect(t2);
+    t2.connect();
+    await vi.waitFor(() => expect(g.attempts).toHaveLength(1));
+    one.push(rowFrames("2026-08-01T00:00:09Z", "2026-08-01T00:00:09Z", { n: 1 }));
+    await vi.waitFor(() => expect(seen.events).toHaveLength(1));
+    one.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(g.attempts).toHaveLength(2));
+    expect(new URL(g.attempts[1].url).searchParams.get("since")).toBeNull();
+    expect(headersOf(g.attempts[1])["Last-Event-ID"]).toBe("2026-08-01T00:00:09Z");
+    t2.disconnect();
   });
 });

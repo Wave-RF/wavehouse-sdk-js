@@ -1,8 +1,9 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request } from "./http.js";
 import { QueryBuilder } from "./query-builder.js";
 import type { StreamController } from "./stream/controller.js";
 import type {
+  CallOptions,
   HttpContext,
   InsertRecordResult,
   InsertResult,
@@ -110,7 +111,7 @@ export class TableRef<Row = Record<string, unknown>> {
    */
   async insert(
     data: Partial<Row> | Partial<Row>[],
-    opts?: { signal?: AbortSignal },
+    opts?: CallOptions,
   ): Promise<Result<InsertResult>> {
     if (Array.isArray(data)) {
       if (data.length === 0) {
@@ -128,7 +129,7 @@ export class TableRef<Row = Record<string, unknown>> {
       // Ingest requires a declared format — an undeclared Content-Type is a
       // 415 — so state it here rather than leaning on the request default.
       contentType: JSON_CONTENT_TYPE,
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
 
     if (error) return err(error);
@@ -149,10 +150,7 @@ export class TableRef<Row = Record<string, unknown>> {
    * ingested, and must be split across several calls. Returns the same
    * per-record batch summary as an array `insert`.
    */
-  async insertNDJSON(
-    source: NDJSONSource,
-    opts?: { signal?: AbortSignal },
-  ): Promise<Result<InsertResult>> {
+  async insertNDJSON(source: NDJSONSource, opts?: CallOptions): Promise<Result<InsertResult>> {
     const ndjson = await ndjsonSourceToString(source);
     return this._sendNDJSON(ndjson, opts);
   }
@@ -163,16 +161,13 @@ export class TableRef<Row = Record<string, unknown>> {
    * Result error arm; a processed batch (even with rejected records) surfaces
    * as the success arm with `ok = failed === 0`.
    */
-  private async _sendNDJSON(
-    ndjson: string,
-    opts?: { signal?: AbortSignal },
-  ): Promise<Result<InsertResult>> {
+  private async _sendNDJSON(ndjson: string, opts?: CallOptions): Promise<Result<InsertResult>> {
     const { data, error } = await request<BatchIngestResponse>(this._ctx, {
       method: "POST",
       path: `/v1/ingest?table=${encodeURIComponent(this._table)}`,
       rawBody: ndjson,
       contentType: NDJSON_CONTENT_TYPE,
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
 
     if (error) return err(error);
@@ -191,13 +186,13 @@ export class TableRef<Row = Record<string, unknown>> {
     return ok(result);
   }
 
-  /** Fetch the schema for this table — under `opts.tenant`, the default tenant without it. */
+  /** Fetch the schema for this table */
   async schema(opts?: OpsRequestOptions): Promise<Result<TableSchema>> {
     const { data, error } = await request<TableSchema>(this._ctx, {
       method: "GET",
       path: "/v1/ops/schema",
-      params: { table: this._table, ...tenantParam(opts) },
-      signal: opts?.signal,
+      params: { table: this._table },
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);

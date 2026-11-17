@@ -16,11 +16,21 @@ export async function parseErrorResponse(res: Response): Promise<WaveHouseError>
         ? body.message
         : res.statusText;
 
+  // On an API answer, `retryable` is the server's own verdict (or the status's
+  // default): the answer is transient, not a promise that this SDK resends it.
+  // A `wh.sql()` call is never resent after an answer, and a pipe call only on
+  // the server's own `retryable: true`, a 429 or a 503 with `Retry-After`, so
+  // either can carry `retryable: true` and still be sent once.
+  //
   // The server's own `code` and `retryable` win where it sends them (a
-  // failed ClickHouse query, for one); the status decides otherwise.
+  // failed ClickHouse query, for one); the status decides otherwise: 5xx, 408
+  // and 429, the standard "try again".
   const code =
     typeof body?.code === "string" && body.code !== "" ? body.code : `HTTP_${res.status}`;
-  const retryable = typeof body?.retryable === "boolean" ? body.retryable : res.status >= 500;
+  const retryable =
+    typeof body?.retryable === "boolean"
+      ? body.retryable
+      : res.status >= 500 || res.status === 408 || res.status === 429;
   return {
     status: res.status,
     code,
@@ -30,7 +40,13 @@ export async function parseErrorResponse(res: Response): Promise<WaveHouseError>
   };
 }
 
-/** Create a WaveHouseError from a network/fetch error. */
+/**
+ * Create a WaveHouseError from a network/fetch error.
+ *
+ * `retryable` is true here, and `request` then adjusts it for the call: it is
+ * cleared for a `wh.sql()` or pipe call whose request may have reached the
+ * server, where `true` means a resend is safe.
+ */
 export function networkError(cause: unknown): WaveHouseError {
   const message = cause instanceof Error ? cause.message : String(cause);
   return {

@@ -50,12 +50,52 @@ describe("createClient", () => {
     expect(client._ctx.options.maxRetries).toBe(2);
   });
 
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects maxRetries %s at construction",
+    (n) => {
+      expect(() =>
+        createClient({ baseURL: "http://localhost:8080", options: { maxRetries: n } }),
+      ).toThrow(/maxRetries must be a non-negative integer/);
+    },
+  );
+
+  it.each(["/api/warehouse", "/", "https:///x"])(
+    "rejects the host-less baseURL %j at construction",
+    (baseURL) => {
+      expect(() => createClient({ baseURL })).toThrow(/baseURL .* is not a usable URL/);
+    },
+  );
+
+  it.each(["ws://localhost:8080", "wss://example.com/api", "ftp://example.com"])(
+    "rejects the non-http baseURL %j at construction",
+    (baseURL) => {
+      expect(() => createClient({ baseURL })).toThrow(/must use http or https/);
+    },
+  );
+
+  it.each(["http://localhost:8080", "HTTPS://example.com/api", "localhost:8080"])(
+    "accepts the baseURL %j",
+    (baseURL) => {
+      expect(() => createClient({ baseURL })).not.toThrow();
+    },
+  );
+
+  it("accepts maxRetries 0", () => {
+    const client = createClient({ baseURL: "http://localhost:8080", options: { maxRetries: 0 } });
+    expect(client._ctx.options.maxRetries).toBe(0);
+  });
+
   it("respects custom maxRetries", () => {
     const client = createClient({
       baseURL: "http://localhost:8080",
       options: { maxRetries: 5 },
     });
     expect(client._ctx.options.maxRetries).toBe(5);
+  });
+
+  it("throws on a baseURL carrying a query string or fragment", () => {
+    expect(() => createClient({ baseURL: "http://localhost:8080/api?x=1" })).toThrow(/query/);
+    expect(() => createClient({ baseURL: "http://localhost:8080/api#top" })).toThrow(/fragment/);
   });
 
   it("passes auth function to context", () => {
@@ -238,7 +278,7 @@ describe("options.headers", () => {
   it("adds configured headers to every request", async () => {
     const client = createClient({
       baseURL: "http://localhost:8080",
-      options: { headers: { "CF-Access-Client-Id": "abc.access", "X-Tenant": "acme" } },
+      options: { headers: { "CF-Access-Client-Id": "abc.access", "X-Trace": "abc" } },
     });
 
     await client.from("clicks").select("*").limit(1);
@@ -249,7 +289,7 @@ describe("options.headers", () => {
     for (const call of [0, 1]) {
       expect(headersOf(call)).toMatchObject({
         "CF-Access-Client-Id": "abc.access",
-        "X-Tenant": "acme",
+        "X-Trace": "abc",
       });
     }
   });
@@ -285,29 +325,29 @@ describe("options.headers", () => {
 
   it("collapses two configured spellings of one header instead of sending both", async () => {
     // Left as separate keys, the Headers constructor comma-joins them at fetch
-    // time — `x-tenant: acme, beta` — which is the corruption this guards.
+    // time — `x-trace: abc, beta` — which is the corruption this guards.
     const client = createClient({
       baseURL: "http://localhost:8080",
-      options: { headers: { "x-tenant": "acme", "X-Tenant": "beta" } },
+      options: { headers: { "x-trace": "abc", "X-Trace": "beta" } },
     });
 
     await client.from("clicks").select("*").limit(1);
 
     const sent = headersOf(0);
-    const spellings = Object.keys(sent).filter((k) => k.toLowerCase() === "x-tenant");
+    const spellings = Object.keys(sent).filter((k) => k.toLowerCase() === "x-trace");
     expect(spellings).toHaveLength(1);
-    expect(new Headers(sent).get("x-tenant")).toBe("beta");
+    expect(new Headers(sent).get("x-trace")).toBe("beta");
   });
 
   it("still applies when no auth is configured", async () => {
     const client = createClient({
       baseURL: "http://localhost:8080",
-      options: { headers: { "X-Tenant": "acme" } },
+      options: { headers: { "X-Trace": "abc" } },
     });
 
     await client.from("clicks").select("*").limit(1);
 
-    expect(headersOf(0)["X-Tenant"]).toBe("acme");
+    expect(headersOf(0)["X-Trace"]).toBe("abc");
     expect(headersOf(0).Authorization).toBeUndefined();
   });
 });
@@ -331,11 +371,11 @@ describe("options.fetchOptions", () => {
       baseURL: "http://localhost:8080",
       auth: () => "test-token",
       options: {
-        headers: { "X-Tenant": "acme" },
+        headers: { "X-Trace": "abc" },
         fetchOptions: {
           method: "DELETE",
           body: "hijacked",
-          headers: { "X-Tenant": "overridden", Authorization: "Bearer impostor" },
+          headers: { "X-Trace": "overridden", Authorization: "Bearer impostor" },
         } as RequestInit,
       },
     });
@@ -348,7 +388,7 @@ describe("options.fetchOptions", () => {
     // options.headers is the header channel; fetchOptions.headers is discarded
     // wholesale rather than merged, so it can't smuggle an Authorization past auth.
     expect(init.headers).toMatchObject({
-      "X-Tenant": "acme",
+      "X-Trace": "abc",
       Authorization: "Bearer test-token",
     });
   });
@@ -361,7 +401,7 @@ describe("stream error delivery", () => {
     // constructor — so the error fired before `.stream()` had returned and no
     // subscriber could ever see it. Every transport-level test attaches its
     // callbacks before `connect()`, which is exactly why they missed it.
-    const wh = createClient({ baseURL: "not-a-url" });
+    const wh = createClient({ baseURL: "https://[" });
     const stream = wh.from("clicks").stream();
 
     const errors: unknown[] = [];
@@ -375,5 +415,53 @@ describe("stream error delivery", () => {
     await vi.waitFor(() => expect(errors).toHaveLength(1));
     expect((errors[0] as { code: string }).code).toBe("SSE_CONNECT_ERROR");
     expect(statuses).toContain("closed");
+  });
+});
+
+describe("X-Trace-Id through options.headers", () => {
+  // A caller's own header is sent unchanged on every call.
+  const calls: { url: URL; headers: Record<string, string> }[] = [];
+  const fetchStub: FetchLike = async (url, init) => {
+    calls.push({ url: new URL(url), headers: (init?.headers ?? {}) as Record<string, string> });
+    return new Response("[]", { status: 200 });
+  };
+  beforeEach(() => {
+    calls.length = 0;
+  });
+
+  it("reaches data and admin routes unchanged", async () => {
+    const wh = createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: fetchStub, maxRetries: 0, headers: { "X-Trace-Id": "abc" } },
+    });
+    await wh.sys.health();
+    await wh.pipes.list();
+    await wh.from("clicks").select("*").limit(1);
+    expect(calls).toHaveLength(3);
+    for (const c of calls) {
+      expect(c.headers["X-Trace-Id"]).toBe("abc");
+    }
+  });
+
+  it("is not added when the caller sets none", async () => {
+    const wh = createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: fetchStub, maxRetries: 0 },
+    });
+    await wh.sys.health();
+    expect(calls[0].headers["X-Trace-Id"]).toBeUndefined();
+  });
+});
+
+describe("version", () => {
+  it("returns the server build from GET /version", async () => {
+    const info = { version: "1.2.3", git_commit: "abc", build_time: "t", go_version: "go1" };
+    const wh = createClient({
+      baseURL: "http://wavehouse.test",
+      options: { fetch: async () => new Response(JSON.stringify(info), { status: 200 }) },
+    });
+    const res = await wh.version();
+    expect(res.error).toBeNull();
+    expect(res.data).toEqual(info);
   });
 });

@@ -54,6 +54,17 @@ describe("request", () => {
     expect(init.headers["Content-Type"]).toBe("application/json");
   });
 
+  it("sends no Content-Type on a request without a body", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ status: "ok" }), { status: 200 }));
+
+    await request(makeCtx(), { method: "GET", path: "/health" });
+
+    // A Content-Type here would make a cross-origin browser read preflight.
+    const [, init] = fetchSpy.mock.calls[0];
+    expect(Object.keys(init.headers).map((h) => h.toLowerCase())).not.toContain("content-type");
+    expect(init.headers.Accept).toBe("application/json");
+  });
+
   it("sends rawBody verbatim with a custom Content-Type", async () => {
     fetchSpy.mockResolvedValue(new Response(JSON.stringify({ total: 1 }), { status: 200 }));
 
@@ -302,5 +313,129 @@ describe("request", () => {
 
     expect(result.data).toBeUndefined();
     expect(result.error).toBeNull();
+  });
+
+  it("leaves no abort listener behind on a shared signal after retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const ac = new AbortController();
+      const added = vi.spyOn(ac.signal, "addEventListener");
+      const removed = vi.spyOn(ac.signal, "removeEventListener");
+      for (let i = 0; i < 12; i++) {
+        fetchSpy
+          .mockResolvedValueOnce(new Response("{}", { status: 503 }))
+          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+        const pending = request(makeCtx({ options: { maxRetries: 1 } }), {
+          method: "GET",
+          path: "/health",
+          signal: ac.signal,
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect((await pending).data).toEqual({ ok: true });
+      }
+      const aborts = (spy: typeof added) => spy.mock.calls.filter((c) => c[0] === "abort").length;
+      expect(aborts(added)).toBeGreaterThan(0);
+      // Every listener `sleep` attached has been taken off again.
+      expect(aborts(removed)).toBe(aborts(added));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("request redirects", () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  const redirect = () =>
+    new Response(null, {
+      status: 307,
+      headers: { Location: "https://other.example/v1/ops/query" },
+    });
+
+  it("does not follow a redirect when the call carries a token and headers", async () => {
+    fetchSpy.mockImplementation(async () => redirect());
+    const res = await request(
+      makeCtx({
+        options: { maxRetries: 2, headers: { "X-Proxy-Secret": "s3cret" } },
+        auth: () => "tok",
+      }),
+      { method: "POST", path: "/v1/ops/query", rawBody: "DELETE FROM t", kind: "sql" },
+    );
+    expect(fetchSpy.mock.calls[0][1].redirect).toBe("manual");
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(res.data).toBeNull();
+    expect(res.error).toMatchObject({ code: "REDIRECT", status: 307, retryable: false });
+    expect(res.error?.message).toContain("307");
+    expect(res.error?.message).toContain("https://other.example/v1/ops/query");
+  });
+
+  it("does not follow one for a call carrying only per-call headers", async () => {
+    fetchSpy.mockImplementation(async () => redirect());
+    const res = await request(makeCtx(), {
+      method: "GET",
+      path: "/x",
+      headers: { "X-Trace-Id": "abc" },
+    });
+    expect(fetchSpy.mock.calls[0][1].redirect).toBe("manual");
+    expect(res.error?.code).toBe("REDIRECT");
+  });
+
+  it("reports a browser's opaque redirect, which has status 0 and no Location", async () => {
+    fetchSpy.mockImplementation(async () => {
+      const r = new Response(null, { status: 200 });
+      Object.defineProperty(r, "type", { value: "opaqueredirect" });
+      Object.defineProperty(r, "status", { value: 0 });
+      Object.defineProperty(r, "ok", { value: false });
+      return r;
+    });
+    const res = await request(makeCtx({ auth: () => "tok" }), { method: "GET", path: "/x" });
+    expect(res.error).toMatchObject({ code: "REDIRECT", status: 0, retryable: false });
+  });
+
+  it("leaves redirects to fetch when the request carries no credential", async () => {
+    fetchSpy.mockImplementation(async () => new Response("{}", { status: 200 }));
+    await request(makeCtx(), { method: "GET", path: "/x" });
+    expect(fetchSpy.mock.calls[0][1].redirect).toBeUndefined();
+  });
+});
+
+describe("request with a 200 that is not JSON", () => {
+  it.each(["read", "sql", "pipe"] as const)(
+    "returns DECODE_ERROR once for a %s call",
+    async (kind) => {
+      const fetchSpy = vi.fn(async () => new Response("<html>login</html>", { status: 200 }));
+      vi.stubGlobal("fetch", fetchSpy);
+      const res = await request(makeCtx({ options: { maxRetries: 2 } }), {
+        method: "POST",
+        path: "/x",
+        body: {},
+        kind,
+      });
+      vi.unstubAllGlobals();
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(res.error).toMatchObject({ code: "DECODE_ERROR", status: 200, retryable: false });
+      expect(res.error?.message).not.toContain("login");
+    },
+  );
+});
+
+describe("request with an unusable maxRetries", () => {
+  it("still makes one attempt and returns a result, never null data and null error", async () => {
+    const fetchSpy = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const res = await request(makeCtx({ options: { maxRetries: -1 } }), {
+      method: "GET",
+      path: "/x",
+    });
+    vi.unstubAllGlobals();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(res.error).toBeNull();
+    expect(res.data).toEqual({});
   });
 });

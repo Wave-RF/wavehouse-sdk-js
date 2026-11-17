@@ -9,8 +9,8 @@ export default defineConfig({
       provider: "v8",
       reportsDirectory: "./coverage",
       reporter: ["text-summary", "html", "json-summary"],
-      // Floor carried over from the WaveHouse monorepo's unit gate (statements).
-      thresholds: { statements: 40 },
+      // Two points under the measured 89.2% (statements); raise it when coverage rises, never lower it to land a change.
+      thresholds: { statements: 87 },
       include: ["src/**/*.ts"],
       exclude: ["src/**/*.test.ts"],
     },

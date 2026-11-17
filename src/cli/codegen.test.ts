@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chTypeToTS, fetchSchemas, generateTypes, parseArgs } from "./codegen.js";
+import {
+  chTypeToTS,
+  fetchSchemas,
+  generateTypes,
+  parseArgs,
+  resolveCredentials,
+} from "./codegen.js";
 
 // The server's /v1/ops/schema wire shape: a JSON ARRAY of tables (Go
 // SchemaRegistry.List() → []TableSchema), not a name-keyed map. Regression
@@ -43,17 +49,7 @@ describe("fetchSchemas", () => {
     expect(schemas).toEqual(wireSchemas);
     const [url] = fetchSpy.mock.calls[0];
     expect(String(url)).toContain("/v1/ops/schema");
-    // No --tenant: the request names no tenant, so the server reads tenant 0.
-    expect(new URL(String(url)).searchParams.has("tenant")).toBe(false);
-  });
-
-  it("names the tenant in the query string when asked", async () => {
-    fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
-
-    await fetchSchemas("http://localhost:8080", { tenant: "acme" });
-
-    const [url] = fetchSpy.mock.calls[0];
-    expect(new URL(String(url)).searchParams.get("tenant")).toBe("acme");
+    expect(new URL(String(url)).search).toBe("");
   });
 
   it("sends the bearer token", async () => {
@@ -73,7 +69,7 @@ describe("fetchSchemas", () => {
 
     const [, init] = fetchSpy.mock.calls[0];
     // Two credentials, two headers: the operator key is not a bearer token and
-    // must not overwrite one (--tenant with --auth is a valid flat-directory call).
+    // must not overwrite one.
     expect(init.headers["X-Operator-Key"]).toBe("op-key");
     expect(init.headers.Authorization).toBe("Bearer tok");
   });
@@ -91,7 +87,7 @@ describe("fetchSchemas", () => {
   it("follows redirects while the request carries no credential", async () => {
     fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
 
-    await fetchSchemas("http://localhost:8080", { tenant: "acme" });
+    await fetchSchemas("http://localhost:8080");
 
     const [, init] = fetchSpy.mock.calls[0];
     expect(init.redirect).toBe("follow");
@@ -149,26 +145,20 @@ describe("parseArgs", () => {
     expect(parseArgs(argv())).toEqual({ url: "http://localhost:8080", out: "./wavehouse.d.ts" });
   });
 
-  it.each([
-    ["--tenant", "-t"],
-    ["--operator-key", "-k"],
-  ])("accepts %s and its alias %s", (long, short) => {
-    const key = long === "--tenant" ? "tenant" : "operatorKey";
-    expect(parseArgs(argv(long, "v"))[key]).toBe("v");
-    expect(parseArgs(argv(short, "v"))[key]).toBe("v");
+  it("accepts --operator-key and its alias -k", () => {
+    expect(parseArgs(argv("--operator-key", "v")).operatorKey).toBe("v");
+    expect(parseArgs(argv("-k", "v")).operatorKey).toBe("v");
   });
 
   it("reads every flag together, each independent of the others", () => {
     expect(
-      parseArgs(
-        argv("-u", "http://wh:8080", "-o", "./db.d.ts", "-a", "tok", "-k", "op-key", "-t", "acme"),
-      ),
+      parseArgs(argv("-u", "http://wh:8080", "-o", "./db.d.ts", "-a", "tok", "-k", "op-key")),
     ).toEqual({
       url: "http://wh:8080",
       out: "./db.d.ts",
       auth: "tok",
+      authFromArgv: true,
       operatorKey: "op-key",
-      tenant: "acme",
     });
   });
 
@@ -177,14 +167,13 @@ describe("parseArgs", () => {
     ["--url", "-u"],
     ["--out", "-o"],
     ["--auth", "-a"],
-    ["--tenant", "-t"],
     ["--operator-key", "-k"],
   ];
-  const everyFlag = [...valueFlags.flat(), "--help", "-h"];
+  const everyFlag = [...valueFlags.flat(), "--auth-stdin", "--help", "-h"];
 
   // An unset shell variable is how a flag loses its value: quoted it leaves
   // "", unquoted it lets the flag after it slide into the value's place
-  // (`--operator-key --tenant acme` would send "--tenant" as the key).
+  // (`--operator-key --auth tok` would send "--auth" as the key).
   it.each(valueFlags)(
     "refuses %s (%s) with no value, an empty one, or a flag in its place",
     (long, short) => {
@@ -200,12 +189,89 @@ describe("parseArgs", () => {
   );
 
   it("takes a value that starts with a dash, since only a flag is refused", () => {
-    // Both are legal: the tenant grammar allows "-" anywhere, and a base64url
-    // operator key starts with one once in 64.
-    expect(parseArgs(argv("-t", "-acme", "-k", "-x9_Tq"))).toMatchObject({
-      tenant: "-acme",
-      operatorKey: "-x9_Tq",
+    // Legal: a base64url operator key starts with one once in 64.
+    expect(parseArgs(argv("-k", "-x9_Tq"))).toMatchObject({ operatorKey: "-x9_Tq" });
+  });
+});
+
+describe("resolveCredentials", () => {
+  const noStdin = async () => {
+    throw new Error("stdin must not be read");
+  };
+  const parse = (...flags: string[]) => parseArgs(["node", "codegen.ts", ...flags]);
+
+  it("reads the admin token from WAVEHOUSE_ADMIN_TOKEN without warning", async () => {
+    const warn = vi.fn();
+    const creds = await resolveCredentials(
+      parse(),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      noStdin,
+      warn,
+    );
+    expect(creds.auth).toBe("env-tok");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("reads the token from stdin for --auth-stdin", async () => {
+    const creds = await resolveCredentials(
+      parse("--auth-stdin"),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      async () => "stdin-tok",
+      vi.fn(),
+    );
+    expect(creds.auth).toBe("stdin-tok");
+  });
+
+  it("refuses an empty stdin token and --auth-stdin together with --auth", async () => {
+    await expect(
+      resolveCredentials(parse("--auth-stdin"), {}, async () => "", vi.fn()),
+    ).rejects.toThrow(/empty token/);
+    await expect(
+      resolveCredentials(parse("--auth-stdin", "--auth", "t"), {}, async () => "x", vi.fn()),
+    ).rejects.toThrow(/alternatives/);
+  });
+
+  it("still honours --auth, and says it is deprecated", async () => {
+    const warn = vi.fn();
+    const creds = await resolveCredentials(
+      parse("--auth", "argv-tok"),
+      { WAVEHOUSE_ADMIN_TOKEN: "env-tok" },
+      noStdin,
+      warn,
+    );
+    expect(creds.auth).toBe("argv-tok");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/--auth is deprecated/));
+  });
+
+  it("takes the operator key from the flag, else WAVEHOUSE_OPERATOR_KEY", async () => {
+    const env = { WAVEHOUSE_OPERATOR_KEY: "env-key" };
+    expect((await resolveCredentials(parse(), env, noStdin, vi.fn())).operatorKey).toBe("env-key");
+    expect(
+      (await resolveCredentials(parse("-k", "flag-key"), env, noStdin, vi.fn())).operatorKey,
+    ).toBe("flag-key");
+  });
+
+  it("sends no credential when none is given", async () => {
+    expect(await resolveCredentials(parse(), {}, noStdin, vi.fn())).toEqual({
+      auth: undefined,
+      operatorKey: undefined,
     });
+  });
+});
+
+describe("parseArgs unknown arguments", () => {
+  const argv = (...flags: string[]) => ["node", "codegen.ts", ...flags];
+
+  // Each of these used to parse cleanly and be skipped, leaving no key.
+  it.each([
+    [["--operator-ket", "k"]],
+    [["--operator-key-id", "k"]],
+    [["-K", "k"]],
+    [["--operator-key=k"]],
+    [["k"]],
+    [["--operator-ket", "k", "--auth", "tok"]],
+  ])("refuses %j rather than skipping it", (flags) => {
+    expect(() => parseArgs(argv(...flags))).toThrow(/unknown argument/);
   });
 });
 
@@ -243,12 +309,60 @@ describe("generateTypes", () => {
   });
 });
 
+describe("generateTypes with names that are not identifiers", () => {
+  const col = (name: string) => ({ name, type: "String", is_nullable: false, has_default: false });
+
+  it("quotes table and column names that are not bare identifiers", () => {
+    const out = generateTypes([
+      { name: "my-table", columns: [col("user-id"), col("2fa"), col("order id"), col("plain")] },
+    ]);
+    expect(out).toContain('"my-table": MyTableRow;');
+    expect(out).toContain('  "user-id": string;');
+    expect(out).toContain('  "2fa": string;');
+    expect(out).toContain('  "order id": string;');
+    expect(out).toContain("  plain: string;");
+  });
+
+  it("keeps a hostile name from adding declarations", () => {
+    const out = generateTypes([
+      { name: "t", columns: [col("x: string; }\nexport const evil = 1; {")] },
+    ]);
+    expect(out).not.toMatch(/^export const evil/m);
+    // One interface per table plus Database, no more.
+    expect(out.match(/^export interface /gm)).toHaveLength(2);
+  });
+
+  it("gives tables that differ only in case distinct interface names", () => {
+    const out = generateTypes([
+      { name: "user_events", columns: [col("a")] },
+      { name: "USER_EVENTS", columns: [col("b")] },
+    ]);
+    const names = [...out.matchAll(/^export interface (\w+) \{/gm)].map((m) => m[1]);
+    expect(names).toHaveLength(3);
+    expect(new Set(names).size).toBe(3);
+  });
+
+  it("emits a valid interface name for a name that starts with a digit or has no letters", () => {
+    const out = generateTypes([
+      { name: "2024_logs", columns: [col("a")] },
+      { name: "--", columns: [col("a")] },
+    ]);
+    for (const m of out.matchAll(/^export interface (\S+) \{/gm)) {
+      expect(m[1]).toMatch(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
+    }
+  });
+});
+
 describe("chTypeToTS", () => {
   it.each([
     ["String", "string"],
     ["Nullable(String)", "string | null"],
     ["LowCardinality(String)", "string"],
     ["UInt64", "number"],
+    ["Decimal(18, 4)", "string"],
+    ["Decimal64(4)", "string"],
+    ["Nullable(Decimal(10, 2))", "string | null"],
+    ["Array(Decimal(10, 2))", "string[]"],
     ["Bool", "boolean"],
     ["DateTime64(3, 'UTC')", "string"],
     ["Array(UInt8)", "number[]"],
@@ -257,5 +371,22 @@ describe("chTypeToTS", () => {
     ["AggregateFunction(sum, UInt64)", "unknown"],
   ])("%s → %s", (ch, ts) => {
     expect(chTypeToTS(ch)).toBe(ts);
+  });
+});
+
+describe("generateTypes Decimal columns", () => {
+  it("types a Decimal as string and says why", () => {
+    const out = generateTypes([
+      {
+        name: "ledger",
+        columns: [
+          { name: "amount", type: "Decimal(18, 4)", is_nullable: false, has_default: false },
+        ],
+      },
+    ]);
+    expect(out).toMatch(/quoted string[\s\S]*\*\/\n\s+amount: string;/);
+    expect(out).toContain("A stream row carries the value as the producer sent it");
+    expect(out).toContain("`sql()` returns");
+    expect(out).toContain("ClickHouse JSON numbers");
   });
 });

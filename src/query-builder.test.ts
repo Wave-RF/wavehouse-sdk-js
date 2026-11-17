@@ -81,15 +81,24 @@ describe("QueryBuilder", () => {
       ["<=", "lte"],
       ["in", "in"],
       ["like", "like"],
-      ["not_like", "not_like"],
     ] as const;
 
+    // The operators the server's filter builder implements; it answers any
+    // other with "unsupported operator", which is a 400 at runtime.
+    const serverOps = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "like", "in"]);
+
     for (const [sdkOp, backendOp] of ops) {
+      expect(serverOps.has(backendOp)).toBe(true);
       fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }));
       await builder().where("col", sdkOp, "v").fetch();
       const body = JSON.parse(fetchSpy.mock.calls.at(-1)![1].body);
       expect(body.filters[0].op).toBe(backendOp);
     }
+  });
+
+  it("does not offer not_like, which the server rejects on queries", () => {
+    // @ts-expect-error not_like is not a FilterOp
+    builder().where("col", "not_like", "%x%");
   });
 
   it("accumulates multiple where clauses", async () => {
@@ -161,6 +170,32 @@ describe("QueryBuilder", () => {
     expect(body.order_by).toEqual([{ column: "score", dir: "desc" }]);
   });
 
+  it("lowercases the orderBy direction", async () => {
+    await builder()
+      .orderBy("score", "DESC" as "desc")
+      .fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.order_by).toEqual([{ column: "score", dir: "desc" }]);
+  });
+
+  it("refuses an orderBy direction that is not asc or desc, sending nothing", async () => {
+    const res = await builder()
+      .orderBy("score", "up" as "asc")
+      .fetch();
+
+    expect(res.error?.code).toBe("INVALID_QUERY");
+    expect(res.error?.message).toContain("orderBy");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("omits an empty aggregate alias", async () => {
+    await builder().aggregate("uniqExact", "user_id", "").fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.aggregations).toEqual([{ fn: "uniqExact", column: "user_id" }]);
+  });
+
   // --- Limit ---
 
   it("builds limit", async () => {
@@ -184,6 +219,78 @@ describe("QueryBuilder", () => {
 
     const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
     expect(body.time_range).toEqual({ column: "ts", since: "2026-01-01", until: "2026-02-01" });
+  });
+
+  it("sends a Date bound as UTC ISO-8601", async () => {
+    const since = new Date("2026-01-01T07:00:00.123-05:00");
+    await builder().timeRange("ts", since, new Date("2026-02-01T00:00:00Z")).fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.time_range).toEqual({
+      column: "ts",
+      since: "2026-01-01T12:00:00.123Z",
+      until: "2026-02-01T00:00:00.000Z",
+    });
+  });
+
+  it("refuses an invalid Date before sending", async () => {
+    for (const q of [
+      builder().timeRange("ts", new Date(Number.NaN)),
+      builder().timeRange("ts", "1h", new Date("nope")),
+    ]) {
+      const res = await q.fetch();
+      expect(res.error?.code).toBe("INVALID_QUERY");
+      expect(res.error?.message).toContain("invalid Date");
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // --- Last ---
+
+  it("builds last from a duration string, as given", async () => {
+    for (const d of ["1h", "7d", "2w", "90s", "15m", "500ms", "1.5h", "0.5d"] as const) {
+      fetchSpy.mockClear();
+      await builder().last("ts", d).fetch();
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.time_range).toEqual({ column: "ts", since: d });
+    }
+  });
+
+  it("builds last from milliseconds", async () => {
+    await builder().last("ts", 3_600_000).fetch();
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.time_range).toEqual({ column: "ts", since: "3600000ms" });
+  });
+
+  it("refuses a non-positive or unparseable last before sending", async () => {
+    const bad = [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      1e21,
+      1e-7,
+      1e13,
+      "0s",
+      "-1h",
+      "1x",
+      "h",
+      "1",
+      "",
+      "now-1h",
+      "1h30m",
+      " 1h",
+      "1y",
+      "999999999999d",
+    ];
+    for (const d of bad) {
+      const res = await builder()
+        .last("ts", d as never)
+        .fetch();
+      expect(res.error?.code, String(d)).toBe("INVALID_QUERY");
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   // --- Empty AST ---
@@ -396,6 +503,34 @@ describe("QueryBuilder", () => {
     expect(received[0].page).toBe("/home");
   });
 
+  describe("selectAll() exclusivity", () => {
+    const cases: [string, () => QueryBuilder][] = [
+      ["select() then selectAll()", () => builder().select("page").selectAll()],
+      ["selectAll() then select()", () => builder().selectAll().select("page")],
+      ["selectAll() then count()", () => builder().selectAll().count()],
+      ["count() then selectAll()", () => builder().count().selectAll()],
+    ];
+
+    it.each(cases)("%s resolves to INVALID_QUERY and sends nothing", async (_name, make) => {
+      const result = await make().fetch();
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("INVALID_QUERY");
+      expect(result.error?.retryable).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("still sends selectAll() alone, and with filters and ordering", async () => {
+      await builder().selectAll().where("score", ">", 1).orderBy("score").fetch();
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.select_all).toBe(true);
+      expect(body.columns).toBeUndefined();
+    });
+  });
+
+  it("offers no cacheTTL(): the server picks the cache TTL, so a setter could only mislead", () => {
+    expect("cacheTTL" in builder()).toBe(false);
+  });
+
   // --- Complex chain ---
 
   it("builds a complex query", async () => {
@@ -407,7 +542,6 @@ describe("QueryBuilder", () => {
       .orderBy("total", "desc")
       .limit(50)
       .timeRange("received_timestamp", "1h")
-      .cacheTTL(60)
       .fetch();
 
     const body = JSON.parse(fetchSpy.mock.calls[0][1].body);

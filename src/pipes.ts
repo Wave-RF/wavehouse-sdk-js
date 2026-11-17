@@ -1,41 +1,25 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
-import type { StreamController } from "./stream/controller.js";
-import type {
-  HttpContext,
-  OpsRequestOptions,
-  Pipe,
-  PipeRequestOptions,
-  Result,
-  StreamOptions,
-} from "./types.js";
-
-type CreateStreamFn<Row> = (table: string, opts?: StreamOptions) => StreamController<Row>;
+import { callOpts, request } from "./http.js";
+import type { HttpContext, OpsRequestOptions, Pipe, PipeRequestOptions, Result } from "./types.js";
 
 /** Reference to a named query pipe — PromiseLike for convenient `await`. */
 export class PipeRef<Row = Record<string, unknown>> implements PromiseLike<Result<Row[]>> {
   private readonly _ctx: HttpContext;
   private readonly _name: string;
   private readonly _params?: Record<string, unknown>;
-  private readonly _createStream: CreateStreamFn<Row>;
 
-  constructor(
-    ctx: HttpContext,
-    name: string,
-    params: Record<string, unknown> | undefined,
-    createStream: CreateStreamFn<Row>,
-  ) {
+  constructor(ctx: HttpContext, name: string, params: Record<string, unknown> | undefined) {
     this._ctx = ctx;
     this._name = name;
     this._params = params;
-    this._createStream = createStream;
   }
 
   /**
    * Execute the pipe and return results.
    *
-   * Takes only `signal` — deliberately narrower than the `RequestOptions` the
-   * query builder accepts. The pipes endpoint binds the body as the pipe's
+   * Takes `PipeRequestOptions`: `signal`, `attemptTimeoutMs`, `headers`,
+   * `fetchOptions` and `fetch` — deliberately narrower than the `RequestOptions`
+   * the query builder accepts, which adds `limit`. The pipes endpoint binds the body as the pipe's
    * parameters, so there is no row cap to forward; give the pipe a `{{limit}}`
    * parameter in its SQL and pass it via `wh.pipe(name, { limit })`.
    */
@@ -44,15 +28,11 @@ export class PipeRef<Row = Record<string, unknown>> implements PromiseLike<Resul
       method: "POST",
       path: `/v1/pipes/${encodeURIComponent(this._name)}`,
       body: this._params ?? {},
-      signal: opts?.signal,
+      kind: "pipe",
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
-  }
-
-  /** Subscribe to live events from the pipe's underlying query. */
-  stream(opts?: StreamOptions): StreamController<Row> {
-    return this._createStream(this._name, opts);
   }
 
   then<TResult1 = Result<Row[]>, TResult2 = never>(
@@ -78,25 +58,23 @@ export class PipesNamespace {
     this._ctx = ctx;
   }
 
-  /** List all registered pipes — of `opts.tenant`, the default tenant without it. */
+  /** List all registered pipes */
   async list(opts?: OpsRequestOptions): Promise<Result<Pipe[]>> {
     const { data, error } = await request<Pipe[]>(this._ctx, {
       method: "GET",
       path: "/v1/ops/pipes",
-      params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);
   }
 
-  /** Get a single pipe definition by name — of `opts.tenant`, the default tenant without it. */
+  /** Get a single pipe definition by name */
   async get(name: string, opts?: OpsRequestOptions): Promise<Result<Pipe>> {
     const { data, error } = await request<Pipe>(this._ctx, {
       method: "GET",
       path: `/v1/ops/pipes/${encodeURIComponent(name)}`,
-      params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);

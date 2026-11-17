@@ -19,6 +19,7 @@ export { TableRef } from "./table.js";
 // --- Types ---
 export type {
   Aggregation,
+  CallOptions,
   // Config
   ClientConfig,
   ClientOptions,
@@ -28,10 +29,12 @@ export type {
   Database,
   // DLQ
   DLQStats,
+  Duration,
   // HTTP
   FetchLike,
   // Query
   FilterOp,
+  HeadersProvider,
   InsertPermissions,
   // Ingest
   InsertRecordResult,

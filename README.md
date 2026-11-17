@@ -10,7 +10,7 @@ npm install @wavehouse/sdk
 
 Requires Node 22 or newer — the only line this SDK is tested against; Node 18 and 20 are past upstream end-of-life. Neither browsers nor Node need a polyfill: streaming runs on `fetch`, like the rest of the SDK — see [Runtime support](https://wavehouse.dev/sdk/#runtime-support).
 
-This works in any framework that uses a bundler — React, Vue, Svelte, Angular, Astro, SolidJS, or plain Vite — with `import { createClient } from '@wavehouse/sdk'`. The SDK and the server share the SSE wire protocol, so move them as a **pair** — a skewed pair delivers no usable rows and raises no error ([details](https://wavehouse.dev/sdk/streaming)).
+This works in any framework that uses a bundler — React, Vue, Svelte, Angular, Astro, SolidJS, or plain Vite — with `import { createClient } from '@wavehouse/sdk'`.
 
 The package is published with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) — npm shows a verified provenance badge on the [package page](https://www.npmjs.com/package/@wavehouse/sdk), and `npm audit signatures` checks the attestation against this repository's signed build.
 
@@ -30,7 +30,7 @@ No bundler, no `npm`, no framework required — drop the SDK straight into an HT
 </script>
 ```
 
-Pin a version for production (`https://esm.sh/@wavehouse/sdk@0.2.0`). jsDelivr (`https://cdn.jsdelivr.net/npm/@wavehouse/sdk/+esm`) and unpkg (`https://unpkg.com/@wavehouse/sdk?module`) serve the same ES module. The SDK and the server share the SSE wire protocol, so pin them as a **pair** — a skewed pair delivers no usable rows and raises no error.
+Pin a version for production (`https://esm.sh/@wavehouse/sdk@0.3.0`). jsDelivr (`https://cdn.jsdelivr.net/npm/@wavehouse/sdk/+esm`) and unpkg (`https://unpkg.com/@wavehouse/sdk?module`) serve the same ES module.
 
 **Classic global (`<script src>`).** For pages that can't use ES modules, the bundled IIFE build attaches everything to a `WaveHouse` global:
 
@@ -42,7 +42,7 @@ Pin a version for production (`https://esm.sh/@wavehouse/sdk@0.2.0`). jsDelivr (
 </script>
 ```
 
-**Versioning.** A bare CDN URL serves the latest published **release**; pin for production (`@wavehouse/sdk@0.2.0`) or float on a range (`@0` for the newest 0.x, `@0.2` for 0.2.x). Builds from `main` are published under the `dev` tag — `@wavehouse/sdk@dev` — for trying unreleased changes. Whichever you choose, move the SDK and the server together: they share the SSE wire protocol, and a skewed pair delivers no usable rows and raises no error — a newer SDK drops every row, an older one hands you an event per frame with `data: undefined`.
+**Versioning.** A bare CDN URL serves the latest published **release**; pin for production (`@wavehouse/sdk@0.3.0`) or float on a range (`@0` for the newest 0.x, `@0.3` for 0.3.x). Builds from `main` are published under the `dev` tag — `@wavehouse/sdk@dev` — for trying unreleased changes.
 
 Streaming (`.stream()`) runs on `fetch`, so it works in both forms with no polyfill.
 
@@ -71,7 +71,13 @@ const { data, error } = await wh
   .groupBy('page', 'button')
   .orderBy('total', 'desc')
   .limit(50)
-  .timeRange('received_timestamp', '1h');
+  .last('received_timestamp', '1h');
+
+// A window is last(column, '1h' | 90_000) on the server's clock, or
+// timeRange(column, since, until?) with Dates (sent as UTC ISO-8601) or strings.
+// A zero, negative or unparseable duration, or an invalid Date, is an INVALID_QUERY error.
+
+// Direction is "asc" or "desc" (case-insensitive); anything else is an INVALID_QUERY error.
 
 // Raw SQL (requires admin role)
 const { data } = await wh.sql('SELECT page, count() FROM clicks GROUP BY page LIMIT 10');
@@ -112,6 +118,37 @@ while (result.hasMore && result.next) {
 }
 ```
 
+### Server version
+
+```ts
+const { data: build } = await wh.version(); // GET /version: { version, git_commit, build_time, go_version }
+```
+
+### Authentication, headers and timeouts
+
+```ts
+const wh = createClient({
+  baseURL: 'http://localhost:8080',
+  // Runs before EVERY attempt: each retry, and each stream (re)connect.
+  auth: () => tokenCache.get(),
+  options: {
+    attemptTimeoutMs: 8_000, // each attempt gets its own deadline; off by default
+    headers: () => ({ 'X-Access-Secret': secretCache.get() }), // or a plain object
+  },
+});
+
+// Per call: headers, fetchOptions (Next.js `next: { tags }`) and a request-scoped fetch.
+await wh.from('clicks').selectAll().fetch({
+  headers: { 'X-Trace-Id': traceId },
+  fetchOptions: { next: { tags: ['clicks'] } },
+  attemptTimeoutMs: 2_000,
+});
+```
+
+`auth` and a function-valued `options.headers` are called before every attempt, so a token that changed during a backoff is the one a retry sends. They must be cheap: caching and refreshing are yours to do, not the SDK's. Headers layer, lowest to highest: `options.headers`, the call's `headers`, `auth`'s `Authorization`, then the SDK's own `Content-Type` and `Accept`; names match case-insensitively and a later layer replaces, never joins. `await`ing a builder takes no options, so pass them through `.fetch({ ... })`.
+
+`attemptTimeoutMs` bounds one attempt, from sending to the end of the body. A stalled attempt is retried after a backoff while `maxRetries` allows, and the final error is `ATTEMPT_TIMEOUT`, naming the attempt count. Your `signal` still ends the call at once with `ABORTED`. `wh.sql()` and pipe calls are not resent after a timeout, since the request may have run. For streams it bounds each connect up to the response headers, never an established stream.
+
 ## Type Safety
 
 Pass a `Database` type for autocomplete on table names and row shapes:
@@ -131,7 +168,7 @@ const { data } = await wh.from('clicks').select('page').limit(10);
 
 Async request methods return a `Result<T>` object — destructure it as `{ data, error }` — and never throw for anything the server returns. `.stream()` and `.liveQuery()` return controllers instead, reporting failures through the subscriber's `error` callback.
 
-The SDK does throw on caller and environment errors: a non-absolute `baseURL` (REST calls reject with a `TypeError`; streams report a terminal `SSE_CONNECT_ERROR`), `.stream()` / `.liveQuery()` in a runtime with no global `fetch` and no `options.fetch`, and an `auth` callback that rejects — a token-refresh failure propagates out of the REST call, and on a stream is reported as a retryable `SSE_AUTH_ERROR`. A dropped stream *is* re-dialed by the SDK, on a jittered backoff; only non-retryable failures end it. One more exception can escape an SDK call, though it is yours rather than ours: a subscriber's `status` handler throwing on the first, synchronous `.subscribe()` / `.liveQuery()` call — see [Error Handling](https://wavehouse.dev/sdk/reference#error-handling).
+The SDK does throw on caller and environment errors: a `baseURL` that names no host, such as `/api/warehouse`, or carries a query or fragment (`createClient` throws a `TypeError`; any other unusable base makes REST calls reject with a `TypeError` and streams report a terminal `SSE_CONNECT_ERROR`), `.stream()` / `.liveQuery()` in a runtime with no global `fetch` and no `options.fetch`, and an `auth` callback that rejects — a token-refresh failure propagates out of the REST call, and on a stream is reported as a retryable `SSE_AUTH_ERROR`. A dropped stream *is* re-dialed by the SDK, on a jittered backoff; only non-retryable failures end it. A subscriber callback that throws is logged and isolated: it costs only its own delivery, and never the other subscribers or the SDK call that registered it — see [Error Handling](https://wavehouse.dev/sdk/reference#error-handling).
 
 ```ts
 const { data, error } = await wh.from('clicks').fetch();
@@ -150,7 +187,7 @@ Generate TypeScript types from your live WaveHouse schema. The package ships a `
 npx wavehouse-codegen --url http://localhost:8080 --out ./src/db.d.ts
 ```
 
-This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, and outputs a `Database` interface you can pass to `createClient<Database>()`. `/v1/ops/schema` is **admin-only** — pass an admin-role token with `--auth <jwt>` (or `-a`) against any non-dev policy. Over a nested settings directory the route admits the operator key alone: pass it with `--operator-key <key>` (or `-k`) and name the tenant with `--tenant <id>` (or `-t`); without `--tenant` it reads tenant `0`'s schema.
+This introspects `/v1/ops/schema`, maps ClickHouse column types to TypeScript, and outputs a `Database` interface you can pass to `createClient<Database>()`. `/v1/ops/schema` is **admin-only** — pass an admin-role token against any non-dev policy, in the `WAVEHOUSE_ADMIN_TOKEN` environment variable or on stdin with `--auth-stdin`. `--auth <jwt>` (or `-a`) still works but is deprecated, because an argument shows in the process list and shell history. A server that takes the operator key instead of a JWT reads it from `--operator-key <key>` (or `-k`, or `WAVEHOUSE_OPERATOR_KEY`).
 
 ## Development & Testing
 
@@ -163,7 +200,7 @@ Unit tests mock all HTTP calls — no backend required.
 ```bash
 pnpm test               # run unit tests (no backend needed)
 pnpm run test:watch     # watch mode
-pnpm run test:coverage  # coverage report, gated at a 40% statement floor
+pnpm run test:coverage  # coverage report, gated at an 87% statement floor
 ```
 
 ### Built Package Smoke Check

@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Result, SettingsReloadResult } from "./types.js";
 
 /**
@@ -24,16 +24,12 @@ export class SettingsNamespace {
    * included); a rejected directory is a 422 error whose `details` carries the
    * same `{ adopted: false, findings }` body, and the previous settings stay
    * in effect.
-   *
-   * `opts.tenant` reloads that tenant's folder alone; without it the whole
-   * directory is reloaded.
    */
   async reload(opts?: OpsRequestOptions): Promise<Result<SettingsReloadResult>> {
     const { data, error } = await request<SettingsReloadResult>(this._ctx, {
       method: "POST",
       path: "/v1/ops/settings/reload",
-      params: tenantParam(opts),
-      signal: opts?.signal,
+      ...callOpts(opts),
     });
     if (error) return err(error);
     return ok(data!);

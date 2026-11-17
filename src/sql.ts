@@ -1,5 +1,5 @@
 import { err, ok } from "./errors.js";
-import { request, tenantParam } from "./http.js";
+import { callOpts, request } from "./http.js";
 import type { HttpContext, OpsRequestOptions, Result } from "./types.js";
 
 /**
@@ -21,8 +21,8 @@ import type { HttpContext, OpsRequestOptions, Result } from "./types.js";
  * no-result mutations — coerced to `[]`). Inline non-JSON `FORMAT` overrides
  * (`SELECT 1 FORMAT CSV` / `FORMAT TSV` / `FORMAT Pretty` / etc.) are NOT
  * compatible with `sql()` — the proxy passes the upstream Content-Type
- * through, and the SDK's JSON decoder throws on a non-JSON body, which the
- * retry layer surfaces as a `NETWORK_ERROR` result (not a structured
+ * through, and the SDK's JSON decoder rejects a non-JSON body, which comes back
+ * as a `DECODE_ERROR` result (not retried, and not a structured
  * format-mismatch error). For CSV/TSV exports, hit `/v1/ops/query`
  * directly with `fetch()` and read the body as text.
  *
@@ -42,9 +42,9 @@ export async function sql<Row = Record<string, unknown>>(
   const { data, error } = await request<Row[]>(ctx, {
     method: "POST",
     path: "/v1/ops/query",
-    params: tenantParam(opts),
     body: { sql: query },
-    signal: opts?.signal,
+    kind: "sql",
+    ...callOpts(opts),
   });
   if (error) return err(error);
   return ok(data!);
